@@ -1548,8 +1548,24 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
     let rafId = 0;
     let prevTime = performance.now();
 
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+    };
+    const onContextRestored = () => {
+      const eng = engineRef.current;
+      rebuildTerrainVertices(eng);
+      rebuildStaticCityMeshes(eng);
+      refreshAnalyticalOverlay(eng, overlayRef.current);
+    };
+    dom.addEventListener('webglcontextlost', onContextLost);
+    dom.addEventListener('webglcontextrestored', onContextRestored);
+
     const animate = (now: number) => {
       rafId = requestAnimationFrame(animate);
+      if (document.visibilityState === 'hidden') {
+        prevTime = now;
+        return;
+      }
       const dt = Math.min(0.05, (now - prevTime) * 0.001);
       prevTime = now;
 
@@ -1977,6 +1993,8 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       dom.removeEventListener('pointercancel', onPointerUpOrCancel);
       dom.removeEventListener('wheel', onWheel);
       dom.removeEventListener('contextmenu', preventCtx);
+      dom.removeEventListener('webglcontextlost', onContextLost);
+      dom.removeEventListener('webglcontextrestored', onContextRestored);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('resize', onResize);

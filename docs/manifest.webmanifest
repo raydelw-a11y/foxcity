@@ -1,0 +1,20 @@
+{
+  "name": "Fox City — Metropolitan 3D Builder",
+  "short_name": "Fox City",
+  "description": "City Builder 3D realista estilo Cities: Skylines con sincronización automática multi-dispositivo vía GitHub Cloud.",
+  "id": "/foxcity/",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#070d19",
+  "theme_color": "#070d19",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

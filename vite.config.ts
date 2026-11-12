@@ -20,17 +20,16 @@ function formatBuildTimestampNY(): string {
 }
 
 export default defineConfig({
+  base: './',
   plugins: [react(), tailwindcss()],
   define: {
     __BUILD_TIMESTAMP__: JSON.stringify(formatBuildTimestampNY()),
   },
+  build: {
+    outDir: 'docs',
+    emptyOutDir: true,
+  },
   server: {
     port: 5173,
-    proxy: {
-      '/api': {
-        target: 'http://localhost:4580',
-        changeOrigin: true,
-      },
-    },
   },
 });

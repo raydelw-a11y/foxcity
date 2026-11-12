@@ -36,6 +36,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { soundFX } from './audio/soundEngine';
+import { CloudSyncModal } from './components/CloudSyncModal';
 import { PrivateAccess } from './components/PrivateAccess';
 import {
   BUILDING_SPECS,
@@ -64,14 +65,19 @@ import {
   deleteCityEverywhere,
   fetchCloudCityFull,
   fetchCloudCitySummaries,
+  flushPendingDirtySlots,
   getOrCreateDeviceId,
+  hydrateEmergencyWalIfAny,
+  isGitHubCloudEnabled,
   listLocalCities,
   LocalSavedCityRecord,
   loadSavedSession,
   pushCityToCloud,
+  saveCityLocally,
+  writeEmergencyWalSync,
 } from './utils/cloudSync';
 
-const FALLBACK_BUILD_TIMESTAMP = '12:10 PM - 11/12/2026';
+const FALLBACK_BUILD_TIMESTAMP = '12:41 PM - 11/12/2026';
 const BUILD_TS =
   typeof __BUILD_TIMESTAMP__ !== 'undefined' ? __BUILD_TIMESTAMP__ : FALLBACK_BUILD_TIMESTAMP;
 
@@ -113,9 +119,13 @@ export const App: React.FC = () => {
   const [showDisasterModal, setShowDisasterModal] = useState(false);
   const [showOverlayMenu, setShowOverlayMenu] = useState(false);
   const [showChirps, setShowChirps] = useState(false);
+  const [showCloudModal, setShowCloudModal] = useState(false);
   const [muted, setMuted] = useState(false);
 
-  const [syncState, setSyncState] = useState<'synced' | 'saving' | 'offline' | 'conflict'>('synced');
+  const [syncState, setSyncState] = useState<'synced' | 'saving' | 'offline' | 'conflict'>(() =>
+    isGitHubCloudEnabled() ? 'synced' : 'offline'
+  );
+  const debouncePushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [conflictData, setConflictData] = useState<{
     serverCity: LocalSavedCityRecord;
     backupSlotId?: string | null;
@@ -132,12 +142,16 @@ export const App: React.FC = () => {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Refresh cloud city list when session is active
+  // Refresh cloud city list & flush any pending offline slots when session is active
   useEffect(() => {
     if (!session) return;
-    void fetchCloudCitySummaries(session).then((remote) => {
+    void (async () => {
+      await hydrateEmergencyWalIfAny();
+      await flushPendingDirtySlots(session);
+      const remote = await fetchCloudCitySummaries(session);
       if (remote) setCities(remote);
-    });
+      setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
+    })();
   }, [session]);
 
   const refreshHud = useCallback(() => {
@@ -199,6 +213,7 @@ export const App: React.FC = () => {
     if (inHub || !engineRef.current) return;
 
     const timer = setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
       const eng = engineRef.current;
       if (!eng || eng.simSpeed === 0) return;
       const steps = eng.simSpeed === 4 ? 3 : eng.simSpeed === 2 ? 2 : 1;
@@ -216,52 +231,82 @@ export const App: React.FC = () => {
     if (!session || inHub) return;
 
     const periodic = setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
       if (engineRef.current?.dirtySync) {
         void syncNow();
       }
-    }, 9000);
+    }, 12000);
 
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') {
+        if (debouncePushRef.current) {
+          clearTimeout(debouncePushRef.current);
+          debouncePushRef.current = null;
+        }
+        const rec = buildSaveRecord();
+        if (rec) {
+          writeEmergencyWalSync(session.accountId, { ...rec, dirtyOffline: true });
+        }
         void syncNow({ keepalive: true });
-      } else if (document.visibilityState === 'visible' && engineRef.current && !engineRef.current.dirtySync) {
-        // Check if another device saved newer progress while this tab was sleeping
-        const curId = engineRef.current.cityId;
-        void fetchCloudCityFull(session, curId).then((latest) => {
-          if (latest && latest.serverRev > activeRevRef.current) {
-            engineRef.current = CityEngine.fromCompactState(latest.compactState);
-            activeRevRef.current = latest.serverRev;
-            refreshHud();
-            showToast('☁️ Ciudad actualizada automáticamente desde otro dispositivo', 'ok');
-          }
-        });
+      } else if (document.visibilityState === 'visible') {
+        void flushPendingDirtySlots(session);
+        if (engineRef.current && !engineRef.current.dirtySync && isGitHubCloudEnabled()) {
+          // Check if another device saved newer progress while this tab was sleeping
+          const curId = engineRef.current.cityId;
+          void fetchCloudCityFull(session, curId).then((latest) => {
+            if (latest && latest.serverRev > activeRevRef.current) {
+              engineRef.current = CityEngine.fromCompactState(latest.compactState);
+              activeRevRef.current = latest.serverRev;
+              refreshHud();
+              showToast('☁️ Ciudad actualizada automáticamente desde otro dispositivo', 'ok');
+            }
+          });
+        }
       }
     };
 
     const onPageHide = () => {
+      const rec = buildSaveRecord();
+      if (rec) {
+        writeEmergencyWalSync(session.accountId, { ...rec, dirtyOffline: true });
+      }
       void syncNow({ keepalive: true });
+    };
+
+    const onOnline = () => {
+      void flushPendingDirtySlots(session).then(() => {
+        if (engineRef.current?.dirtySync) {
+          void syncNow();
+        }
+      });
     };
 
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('online', onOnline);
     return () => {
       clearInterval(periodic);
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('online', onOnline);
     };
-  }, [inHub, refreshHud, session, showToast, syncNow]);
+  }, [buildSaveRecord, inHub, refreshHud, session, showToast, syncNow]);
 
-  const handleUnlock = async (mayorName: string, password: string) => {
-    // Verify private access password (accepts standard user keys or custom account password >= 3 chars)
+  const handleUnlock = async (
+    mayorName: string,
+    password: string,
+    optionalGithubPat?: string
+  ) => {
     const clean = password.trim();
     if (clean.length < 2) {
       return { ok: false, error: 'La contraseña debe tener al menos 2 caracteres.' };
     }
-    const res = await authenticateWithServer(mayorName, clean);
+    const res = await authenticateWithServer(mayorName, clean, optionalGithubPat);
     if (!res.ok) return { ok: false, error: res.error };
 
     setSession(res.session);
     setCities(res.cities);
+    setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
     setInHub(true);
     return { ok: true };
   };
@@ -316,8 +361,20 @@ export const App: React.FC = () => {
     if (session && engineRef.current) {
       const rec = buildSaveRecord();
       if (rec) {
-        // Debounced immediate local persistence happens inside pushCityToCloud
-        void syncNow();
+        // Instant local IndexedDB persistence (0 network stall) + debounced GitHub Gist sync
+        void saveCityLocally(session.accountId, { ...rec, dirtyOffline: true }).then(() => {
+          setCities(listLocalCities(session.accountId));
+        });
+        if (isGitHubCloudEnabled()) {
+          if (debouncePushRef.current) clearTimeout(debouncePushRef.current);
+          const delayMs = window.matchMedia('(pointer: coarse)').matches ? 4000 : 7000;
+          debouncePushRef.current = setTimeout(() => {
+            debouncePushRef.current = null;
+            void syncNow();
+          }, delayMs);
+        } else {
+          setSyncState('offline');
+        }
       }
     }
   }, [buildSaveRecord, refreshHud, session, syncNow]);
@@ -395,22 +452,39 @@ export const App: React.FC = () => {
                   FOX CITY
                 </h1>
                 <p className="text-xs sm:text-sm text-sky-300 font-medium flex items-center gap-1.5">
-                  <Cloud className="w-3.5 h-3.5" /> Alcalde {session.mayorName} • Sincronización
-                  Automática Activa
+                  <Cloud className="w-3.5 h-3.5" /> Alcalde {session.mayorName} •{' '}
+                  {isGitHubCloudEnabled()
+                    ? 'Sincronización GitHub Gist Activa'
+                    : 'Modo Local (Conecta GitHub Cloud para multi-dispositivo)'}
                 </p>
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => {
-                clearAuthSession();
-                setSession(null);
-              }}
-              className="px-3.5 py-2 rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-            >
-              <LogOut className="w-3.5 h-3.5" /> Cambiar Cuenta
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowCloudModal(true)}
+                className={`px-3.5 py-2 rounded-xl border text-xs font-extrabold flex items-center gap-1.5 cursor-pointer ${
+                  isGitHubCloudEnabled()
+                    ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-400/50 text-emerald-200'
+                    : 'bg-sky-500/15 hover:bg-sky-500/25 border-sky-400/50 text-sky-200'
+                }`}
+              >
+                <Cloud className="w-3.5 h-3.5" />
+                {isGitHubCloudEnabled() ? 'Nube GitHub Activa' : 'Conectar Nube / Respaldo'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  clearAuthSession();
+                  setSession(null);
+                }}
+                className="px-3.5 py-2 rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Cambiar Cuenta
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -594,6 +668,24 @@ export const App: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {toast && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-2xl bg-slate-900/95 border border-sky-400/40 text-xs font-bold text-white shadow-2xl">
+            {toast.text}
+          </div>
+        )}
+
+        {showCloudModal && (
+          <CloudSyncModal
+            session={session}
+            onClose={() => setShowCloudModal(false)}
+            onCitiesUpdated={(next) => {
+              setCities(next);
+              setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
+            }}
+            onToast={showToast}
+          />
+        )}
 
         {/* Global Deployment Verification Timestamp */}
         <div className="fixed bottom-1.5 right-2 z-50 pointer-events-none text-[10px] font-mono text-slate-300/85 bg-slate-950/80 border border-sky-400/20 px-1.5 py-0.5 rounded">
@@ -820,18 +912,18 @@ export const App: React.FC = () => {
               {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
             </button>
 
-            {/* Cloud Sync Status Dot */}
+            {/* Cloud Sync Status Dot / Open Cloud Modal */}
             <button
               type="button"
-              onClick={() => void syncNow()}
+              onClick={() => setShowCloudModal(true)}
               title={
                 syncState === 'synced'
-                  ? 'Sincronizado en la nube'
+                  ? 'Nube GitHub sincronizada (toca para opciones/respaldo)'
                   : syncState === 'saving'
-                  ? 'Guardando...'
-                  : 'Guardado local (toca para sincronizar)'
+                  ? 'Guardando en GitHub Gist...'
+                  : 'Modo Local (toca para conectar GitHub Cloud o exportar JSON)'
               }
-              className="px-2 py-1 rounded-xl bg-slate-900 border border-slate-800 flex items-center gap-1.5 text-[10px] font-bold cursor-pointer"
+              className="px-2 py-1 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 flex items-center gap-1.5 text-[10px] font-bold cursor-pointer"
             >
               <span
                 className={`w-2 h-2 rounded-full ${
@@ -841,11 +933,11 @@ export const App: React.FC = () => {
                     ? 'bg-amber-400 animate-ping'
                     : syncState === 'conflict'
                     ? 'bg-rose-500'
-                    : 'bg-slate-400'
+                    : 'bg-sky-400'
                 }`}
               />
               <span className="hidden xl:inline">
-                {syncState === 'synced' ? 'Sync' : syncState === 'saving' ? '...' : 'Local'}
+                {syncState === 'synced' ? 'Nube' : syncState === 'saving' ? '...' : 'Local'}
               </span>
             </button>
           </div>
@@ -1794,6 +1886,21 @@ export const App: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {showCloudModal && (
+        <CloudSyncModal
+          session={session}
+          onClose={() => setShowCloudModal(false)}
+          onCitiesUpdated={(next) => {
+            setCities(next);
+            setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
+          }}
+          onForcePushActiveCity={async () => {
+            await syncNow({ forceOverwrite: true });
+          }}
+          onToast={showToast}
+        />
       )}
 
       {/* Global Deployment Verification Timestamp in Corner */}
