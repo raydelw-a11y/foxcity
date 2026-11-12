@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import https from 'node:https';
 
-const PORT = Number(process.env.PORT || 3090);
+const PORT = Number(process.env.PORT || 4580);
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
 const DB_REPO = (process.env.DB_REPO || 'raydelw-a11y/huellas-chat-db').trim();
 const DB_FILE_PATH = (process.env.FOX_CITY_DB_PATH || 'fox-city-saves.json').trim();
