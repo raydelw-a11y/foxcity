@@ -71,7 +71,7 @@ import {
   pushCityToCloud,
 } from './utils/cloudSync';
 
-const FALLBACK_BUILD_TIMESTAMP = '11:56 AM - 11/12/2026';
+const FALLBACK_BUILD_TIMESTAMP = '12:10 PM - 11/12/2026';
 const BUILD_TS =
   typeof __BUILD_TIMESTAMP__ !== 'undefined' ? __BUILD_TIMESTAMP__ : FALLBACK_BUILD_TIMESTAMP;
 
