@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fox-city
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: DB_REPO
+        sync: false
