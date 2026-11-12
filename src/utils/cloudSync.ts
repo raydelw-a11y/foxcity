@@ -1,18 +1,27 @@
 import { CloudCitySummary, MapArchetypeId } from '../types/game';
 
-const MANIFEST_FILENAME = 'fox-city-cloud-sync.json';
-const GIST_DESCRIPTION = 'Fox City — Metropolitan 3D Cloud Sync';
+const CLOUD_API_BASE = 'https://huellas-api-live.onrender.com/api/foxcity';
+const DEFAULT_ACCOUNT_ID = 'acc_raydel';
+const DEFAULT_MAYOR_NAME = 'Raydel';
+const EXPECTED_UI_GATE_HASH =
+  '0efc70c8fe77f1f313045ff26e75f71c15e459452cc4b9ff8aaf68f2f66d20bf';
 
 const SESSION_KEY = 'foxcity:auth_session_v2';
 const DEVICE_KEY = 'foxcity:device_id_v1';
-const CLOUD_CFG_KEY = 'foxcity:cloud_cfg_v1';
-const ACCOUNTS_KEY = 'foxcity:accounts_v1';
 const LOCAL_INDEX_PREFIX = 'foxcity:index:';
 const DIRTY_SLOTS_KEY = 'foxcity:dirty_slots_v1';
 const WAL_LATEST_KEY = 'foxcity:wal_latest_v1';
+const LAST_SYNC_AT_KEY = 'foxcity:last_cloud_sync_at_v1';
 
 const IDB_NAME = 'foxcity_idb_v1';
 const IDB_STORE = 'city_slots';
+
+// Purge legacy PAT/Gist configuration keys if any existed from an earlier build
+try {
+  localStorage.removeItem('foxcity:cloud_cfg_v1');
+} catch {
+  // ignore
+}
 
 export interface AuthSessionData {
   token: string;
@@ -23,52 +32,6 @@ export interface AuthSessionData {
 export interface LocalSavedCityRecord extends CloudCitySummary {
   compactState: string;
   dirtyOffline?: boolean;
-}
-
-export interface GitHubCloudConfig {
-  pat: string;
-  gistId: string;
-  githubLogin: string;
-  lastEtag: string;
-  lastSyncedAt: string;
-}
-
-interface StoredAccountAuth {
-  mayorName: string;
-  salt: string;
-  passHash: string;
-  createdAt: string;
-}
-
-interface GistAccountBlock {
-  mayorName: string;
-  salt: string;
-  passHash: string;
-  createdAt: string;
-  cities: Record<string, CloudCitySummary>;
-}
-
-interface GistManifestV2 {
-  schemaVersion: 2;
-  app: 'fox-city';
-  updatedAt: string;
-  accounts: Record<string, GistAccountBlock>;
-}
-
-interface GistFileDescriptor {
-  filename?: string;
-  content?: string;
-  truncated?: boolean;
-  raw_url?: string;
-  size?: number;
-}
-
-interface GistApiResponse {
-  id: string;
-  html_url?: string;
-  updated_at?: string;
-  owner?: { login?: string };
-  files?: Record<string, GistFileDescriptor>;
 }
 
 export interface BackupBundleV2 {
@@ -167,23 +130,6 @@ export function sha256Hex(input: string): string {
   return [h0, h1, h2, h3, h4, h5, h6, h7]
     .map((v) => v.toString(16).padStart(8, '0'))
     .join('');
-}
-
-export function normalizeAccountId(mayorName: string): string {
-  const slug = mayorName
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_|_$/g, '');
-  return `acc_${slug || 'alcalde'}`;
-}
-
-function slotGistFilename(accountId: string, slotId: string): string {
-  const safeAcc = accountId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  const safeSlot = slotId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return `foxcity_slot_${safeAcc}_${safeSlot}.json`;
 }
 
 function idbRecordKey(accountId: string, slotId: string): string {
@@ -323,7 +269,6 @@ export async function hydrateEmergencyWalIfAny(): Promise<void> {
   }
 }
 
-// Dirty queue metadata in localStorage so resuming iOS tab knows what still needs Gist push
 function markSlotDirty(accountId: string, slotId: string, dirty: boolean): void {
   try {
     const raw = localStorage.getItem(DIRTY_SLOTS_KEY);
@@ -354,53 +299,20 @@ export function hasDirtySlotsForAccount(accountId: string): string[] {
   }
 }
 
-// --- Cloud Configuration (GitHub PAT + Auto-Discovered Secret Gist) ---
-export function getCloudConfig(): GitHubCloudConfig {
+export function getLastCloudSyncTime(): string {
   try {
-    const raw = localStorage.getItem(CLOUD_CFG_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      return {
-        pat: typeof parsed.pat === 'string' ? parsed.pat.trim() : '',
-        gistId: typeof parsed.gistId === 'string' ? parsed.gistId.trim() : '',
-        githubLogin: typeof parsed.githubLogin === 'string' ? parsed.githubLogin : '',
-        lastEtag: typeof parsed.lastEtag === 'string' ? parsed.lastEtag : '',
-        lastSyncedAt: typeof parsed.lastSyncedAt === 'string' ? parsed.lastSyncedAt : '',
-      };
-    }
+    return localStorage.getItem(LAST_SYNC_AT_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function setLastCloudSyncTime(iso: string): void {
+  try {
+    localStorage.setItem(LAST_SYNC_AT_KEY, iso);
   } catch {
     // ignore
   }
-  return { pat: '', gistId: '', githubLogin: '', lastEtag: '', lastSyncedAt: '' };
-}
-
-export function saveCloudConfig(partial: Partial<GitHubCloudConfig>): GitHubCloudConfig {
-  const next: GitHubCloudConfig = {
-    ...getCloudConfig(),
-    ...partial,
-  };
-  if (typeof partial.pat === 'string') {
-    next.pat = partial.pat.trim();
-  }
-  try {
-    localStorage.setItem(CLOUD_CFG_KEY, JSON.stringify(next));
-  } catch {
-    // ignore
-  }
-  return next;
-}
-
-export function disconnectGitHubCloud(): void {
-  saveCloudConfig({
-    pat: '',
-    gistId: '',
-    githubLogin: '',
-    lastEtag: '',
-  });
-}
-
-export function isGitHubCloudEnabled(): boolean {
-  return Boolean(getCloudConfig().pat);
 }
 
 // --- Device & Session Helpers ---
@@ -421,7 +333,17 @@ export function loadSavedSession(): AuthSessionData | null {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed?.accountId && parsed?.mayorName) return parsed;
+    if (
+      parsed &&
+      typeof parsed.token === 'string' &&
+      parsed.token.startsWith('rpc.') &&
+      parsed.token.length === 68 &&
+      parsed.accountId
+    ) {
+      return parsed as AuthSessionData;
+    }
+    // Invalidate legacy gist.*/local.* session once so user unlocks cleanly with admin123
+    localStorage.removeItem(SESSION_KEY);
   } catch {
     // ignore
   }
@@ -439,24 +361,6 @@ export function saveAuthSession(session: AuthSessionData): void {
 export function clearAuthSession(): void {
   try {
     localStorage.removeItem(SESSION_KEY);
-  } catch {
-    // ignore
-  }
-}
-
-function loadLocalAccounts(): Record<string, StoredAccountAuth> {
-  try {
-    const raw = localStorage.getItem(ACCOUNTS_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    // ignore
-  }
-  return {};
-}
-
-function saveLocalAccounts(accounts: Record<string, StoredAccountAuth>): void {
-  try {
-    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
   } catch {
     // ignore
   }
@@ -500,22 +404,7 @@ export async function loadCityLocally(
 ): Promise<LocalSavedCityRecord | null> {
   await hydrateEmergencyWalIfAny();
   const key = idbRecordKey(accountId, slotId);
-  const fromIdb = await idbGetRecord(key);
-  if (fromIdb) return fromIdb;
-
-  // One-time legacy fallback if an earlier local test stored under fox_city_slot_
-  try {
-    const legacyRaw = localStorage.getItem(`fox_city_slot_${accountId}_${slotId}`);
-    if (legacyRaw) {
-      const parsed = JSON.parse(legacyRaw) as LocalSavedCityRecord;
-      await idbPutRecord(key, parsed);
-      localStorage.removeItem(`fox_city_slot_${accountId}_${slotId}`);
-      return parsed;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
+  return await idbGetRecord(key);
 }
 
 export async function removeCityLocally(accountId: string, slotId: string): Promise<void> {
@@ -525,257 +414,7 @@ export async function removeCityLocally(accountId: string, slotId: string): Prom
   saveLocalIndex(accountId, filtered);
 }
 
-// --- GitHub Gist Low-Level Helpers (ETag, Truncated Raw URL without Auth, Auto-Discovery) ---
-function githubHeaders(pat: string, extra?: Record<string, string>): Record<string, string> {
-  return {
-    Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${pat.trim()}`,
-    'X-GitHub-Api-Version': '2022-11-28',
-    ...(extra || {}),
-  };
-}
-
-let cachedGistPayload: GistApiResponse | null = null;
-let cachedManifest: GistManifestV2 | null = null;
-
-async function readGistFileText(file?: GistFileDescriptor): Promise<string | null> {
-  if (!file) return null;
-  if (file.truncated && file.raw_url) {
-    // IMPORTANT: Never send Authorization header to gist.githubusercontent.com (triggers CORS preflight failure)
-    const rawRes = await fetch(file.raw_url, { cache: 'no-store' });
-    if (!rawRes.ok) return null;
-    return await rawRes.text();
-  }
-  return typeof file.content === 'string' ? file.content : null;
-}
-
-function emptyManifest(): GistManifestV2 {
-  return {
-    schemaVersion: 2,
-    app: 'fox-city',
-    updatedAt: new Date().toISOString(),
-    accounts: {},
-  };
-}
-
-async function parseManifestFromGist(gist: GistApiResponse): Promise<GistManifestV2> {
-  const file = gist.files?.[MANIFEST_FILENAME];
-  const text = await readGistFileText(file);
-  if (!text) return emptyManifest();
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === 'object' && parsed.accounts) {
-      return parsed as GistManifestV2;
-    }
-  } catch {
-    // ignore corrupt manifest
-  }
-  return emptyManifest();
-}
-
-export async function discoverOrCreateFoxCityGist(
-  patInput?: string,
-  forceNetwork = false
-): Promise<{
-  ok: boolean;
-  gist?: GistApiResponse;
-  manifest?: GistManifestV2;
-  notModified?: boolean;
-  error?: string;
-}> {
-  const cfg = getCloudConfig();
-  const pat = (patInput ?? cfg.pat).trim();
-  if (!pat) {
-    return { ok: false, error: 'Sin token de GitHub configurado.' };
-  }
-
-  let gistId = patInput && patInput.trim() !== cfg.pat ? '' : cfg.gistId;
-
-  // Step 1: Try cached gistId with conditional ETag (304 Not Modified costs 0 rate-limit quota)
-  if (gistId) {
-    try {
-      const headers = githubHeaders(
-        pat,
-        !forceNetwork && cfg.lastEtag && cachedGistPayload && cachedManifest
-          ? { 'If-None-Match': cfg.lastEtag }
-          : undefined
-      );
-      const res = await fetch(`https://api.github.com/gists/${encodeURIComponent(gistId)}`, {
-        method: 'GET',
-        headers,
-        cache: 'no-store',
-      });
-
-      if (res.status === 304 && cachedGistPayload && cachedManifest) {
-        return {
-          ok: true,
-          gist: cachedGistPayload,
-          manifest: cachedManifest,
-          notModified: true,
-        };
-      }
-
-      if (res.status === 401 || res.status === 403) {
-        return {
-          ok: false,
-          error: 'Token de GitHub inválido o sin permiso "gist". Verifica tu token.',
-        };
-      }
-
-      if (res.status === 404) {
-        // Secret Gist was deleted manually on GitHub -> auto-recover by clearing gistId and re-discovering
-        gistId = '';
-        saveCloudConfig({ gistId: '', lastEtag: '' });
-      } else if (res.ok) {
-        const gist = (await res.json()) as GistApiResponse;
-        const manifest = await parseManifestFromGist(gist);
-        const etag = res.headers.get('ETag') || '';
-        cachedGistPayload = gist;
-        cachedManifest = manifest;
-        saveCloudConfig({
-          pat,
-          gistId: gist.id,
-          githubLogin: gist.owner?.login || cfg.githubLogin,
-          lastEtag: etag,
-          lastSyncedAt: new Date().toISOString(),
-        });
-        return { ok: true, gist, manifest };
-      }
-    } catch {
-      return { ok: false, error: 'Sin conexión a GitHub API. Tus cambios siguen seguros localmente.' };
-    }
-  }
-
-  // Step 2: Paginated Auto-Discovery (pages 1..5, 100 per page) so user NEVER needs to copy/paste a Gist ID
-  try {
-    const matches: GistApiResponse[] = [];
-    let detectedOwner = cfg.githubLogin;
-
-    for (let page = 1; page <= 5; page++) {
-      const listRes = await fetch(
-        `https://api.github.com/gists?per_page=100&page=${page}`,
-        {
-          method: 'GET',
-          headers: githubHeaders(pat),
-          cache: 'no-store',
-        }
-      );
-
-      if (listRes.status === 401 || listRes.status === 403) {
-        return {
-          ok: false,
-          error: 'Token rechazado por GitHub. Asegúrate de habilitar el permiso "gist".',
-        };
-      }
-      if (!listRes.ok) break;
-
-      const list = (await listRes.json()) as GistApiResponse[];
-      if (!Array.isArray(list) || list.length === 0) break;
-
-      if (!detectedOwner && list[0]?.owner?.login) {
-        detectedOwner = list[0].owner.login;
-      }
-
-      for (const g of list) {
-        if (g.files && g.files[MANIFEST_FILENAME]) {
-          matches.push(g);
-        }
-      }
-
-      if (list.length < 100) break;
-    }
-
-    if (matches.length > 0) {
-      matches.sort(
-        (a, b) =>
-          new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime()
-      );
-      const chosenId = matches[0].id;
-      const fullRes = await fetch(
-        `https://api.github.com/gists/${encodeURIComponent(chosenId)}`,
-        {
-          method: 'GET',
-          headers: githubHeaders(pat),
-          cache: 'no-store',
-        }
-      );
-      if (fullRes.ok) {
-        const gist = (await fullRes.json()) as GistApiResponse;
-        const manifest = await parseManifestFromGist(gist);
-        const etag = fullRes.headers.get('ETag') || '';
-        cachedGistPayload = gist;
-        cachedManifest = manifest;
-        saveCloudConfig({
-          pat,
-          gistId: gist.id,
-          githubLogin: gist.owner?.login || detectedOwner,
-          lastEtag: etag,
-          lastSyncedAt: new Date().toISOString(),
-        });
-        return { ok: true, gist, manifest };
-      }
-    }
-
-    // Step 3: No existing Fox City secret Gist found -> create one automatically
-    const initialManifest = emptyManifest();
-    const createRes = await fetch('https://api.github.com/gists', {
-      method: 'POST',
-      headers: githubHeaders(pat, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        description: GIST_DESCRIPTION,
-        public: false,
-        files: {
-          [MANIFEST_FILENAME]: {
-            content: JSON.stringify(initialManifest, null, 2),
-          },
-        },
-      }),
-    });
-
-    if (!createRes.ok) {
-      return {
-        ok: false,
-        error: `No se pudo crear el Gist automático (HTTP ${createRes.status}). Revisa que el Token tenga permiso "gist".`,
-      };
-    }
-
-    const createdGist = (await createRes.json()) as GistApiResponse;
-    const etag = createRes.headers.get('ETag') || '';
-    cachedGistPayload = createdGist;
-    cachedManifest = initialManifest;
-    saveCloudConfig({
-      pat,
-      gistId: createdGist.id,
-      githubLogin: createdGist.owner?.login || detectedOwner,
-      lastEtag: etag,
-      lastSyncedAt: new Date().toISOString(),
-    });
-    return { ok: true, gist: createdGist, manifest: initialManifest };
-  } catch {
-    return { ok: false, error: 'Error de red al conectar con GitHub Gist.' };
-  }
-}
-
-export function mergeCityLists(
-  localList: CloudCitySummary[],
-  remoteList: CloudCitySummary[]
-): CloudCitySummary[] {
-  const map = new Map<string, CloudCitySummary>();
-  for (const item of localList) {
-    map.set(item.slotId, item);
-  }
-  for (const r of remoteList) {
-    const loc = map.get(r.slotId);
-    if (!loc || r.serverRev >= (loc.serverRev || 0)) {
-      map.set(r.slotId, { ...r, mapId: r.mapId as MapArchetypeId });
-    }
-  }
-  return Array.from(map.values()).sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-  );
-}
-
-// --- Serialized Push Queue so rapid edits never overlap PATCH calls ---
+// --- Serialized Push Queue so rapid edits never overlap cloud calls ---
 let pushQueueChain: Promise<unknown> = Promise.resolve();
 
 function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
@@ -787,330 +426,152 @@ function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-// --- Authentication (Static Local + Multi-Device GitHub Gist Verification) ---
-export async function authenticateWithServer(
-  mayorName: string,
-  password: string,
-  optionalGithubPat?: string
-): Promise<{
+export function prewarmCloudGateway(): void {
+  try {
+    void fetch(`${CLOUD_API_BASE}/health`, {
+      method: 'GET',
+      mode: 'cors',
+      cache: 'no-store',
+    }).catch(() => undefined);
+  } catch {
+    // ignore
+  }
+}
+
+function extractRpcKey(session: AuthSessionData): string {
+  return session.token.startsWith('rpc.') ? session.token.slice(4) : '';
+}
+
+async function postFoxCityRpc<T>(
+  endpoint: string,
+  payload: Record<string, unknown>,
+  options?: { keepalive?: boolean; timeoutMs?: number }
+): Promise<{ status: number; data: T | null }> {
+  const bodyStr = JSON.stringify(payload);
+  const byteLen = new TextEncoder().encode(bodyStr).byteLength;
+  const safeKeepalive = Boolean(options?.keepalive) && byteLen < 60000;
+
+  const controller = typeof AbortController !== 'undefined' && !safeKeepalive
+    ? new AbortController()
+    : null;
+  const timer = controller
+    ? setTimeout(() => controller.abort(), options?.timeoutMs ?? 35000)
+    : null;
+
+  try {
+    // CORS Simple Request (text/plain, NO Authorization header) skips preflight OPTIONS on iOS pagehide
+    const res = await fetch(`${CLOUD_API_BASE}${endpoint}`, {
+      method: 'POST',
+      mode: 'cors',
+      keepalive: safeKeepalive,
+      headers: {
+        'Content-Type': 'text/plain;charset=UTF-8',
+      },
+      body: bodyStr,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    let data: T | null = null;
+    try {
+      data = (await res.json()) as T;
+    } catch {
+      data = null;
+    }
+    return { status: res.status, data };
+  } catch {
+    return { status: 0, data: null };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function authenticateWithServer(password: string): Promise<{
   ok: boolean;
-  offlineFallback?: boolean;
   session: AuthSessionData;
   cities: CloudCitySummary[];
   error?: string;
 }> {
   await hydrateEmergencyWalIfAny();
+  const cleanPass = password.trim().toLowerCase();
 
-  const cleanMayor = mayorName.trim() || 'Alcalde Principal';
-  const cleanPass = password.trim();
-  const accountId = normalizeAccountId(cleanMayor);
-
-  if (optionalGithubPat && optionalGithubPat.trim()) {
-    saveCloudConfig({ pat: optionalGithubPat.trim() });
-  }
-
-  const pat = getCloudConfig().pat;
-  const localAccounts = loadLocalAccounts();
-
-  // Path A: GitHub Cloud Token configured -> verify/sync against Secret Gist
-  if (pat) {
-    const disc = await discoverOrCreateFoxCityGist(pat, true);
-    if (!disc.ok && optionalGithubPat?.trim()) {
-      // User explicitly entered an invalid token on login screen -> tell them clearly
-      return {
-        ok: false,
-        session: { token: '', accountId: '', mayorName: cleanMayor },
-        cities: [],
-        error: disc.error || 'No se pudo validar el Token de GitHub.',
-      };
-    }
-
-    if (disc.ok && disc.manifest && disc.gist) {
-      const remoteAcc = disc.manifest.accounts[accountId];
-      if (remoteAcc) {
-        const expected = sha256Hex(`${remoteAcc.salt}:${cleanPass}`);
-        if (expected !== remoteAcc.passHash) {
-          return {
-            ok: false,
-            session: { token: '', accountId: '', mayorName: cleanMayor },
-            cities: [],
-            error: `Contraseña incorrecta para el perfil "${remoteAcc.mayorName}".`,
-          };
-        }
-        // Sync verified credentials locally
-        localAccounts[accountId] = {
-          mayorName: remoteAcc.mayorName,
-          salt: remoteAcc.salt,
-          passHash: remoteAcc.passHash,
-          createdAt: remoteAcc.createdAt,
-        };
-        saveLocalAccounts(localAccounts);
-
-        const remoteCities = Object.values(remoteAcc.cities || {});
-        const merged = mergeCityLists(listLocalCities(accountId), remoteCities);
-        saveLocalIndex(accountId, merged);
-
-        const session: AuthSessionData = {
-          token: `gist.${accountId}`,
-          accountId,
-          mayorName: remoteAcc.mayorName || cleanMayor,
-        };
-        saveAuthSession(session);
-        return { ok: true, session, cities: merged };
-      } else {
-        // Account does not exist on Gist yet -> check local account if any, then register on Gist
-        let acc = localAccounts[accountId];
-        if (acc) {
-          if (sha256Hex(`${acc.salt}:${cleanPass}`) !== acc.passHash) {
-            return {
-              ok: false,
-              session: { token: '', accountId: '', mayorName: cleanMayor },
-              cities: [],
-              error: 'Contraseña local incorrecta.',
-            };
-          }
-        } else {
-          const salt = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-          acc = {
-            mayorName: cleanMayor,
-            salt,
-            passHash: sha256Hex(`${salt}:${cleanPass}`),
-            createdAt: new Date().toISOString(),
-          };
-          localAccounts[accountId] = acc;
-          saveLocalAccounts(localAccounts);
-        }
-
-        const localList = listLocalCities(accountId);
-        const citiesMap: Record<string, CloudCitySummary> = {};
-        for (const c of localList) citiesMap[c.slotId] = c;
-
-        disc.manifest.accounts[accountId] = {
-          mayorName: cleanMayor,
-          salt: acc.salt,
-          passHash: acc.passHash,
-          createdAt: acc.createdAt,
-          cities: citiesMap,
-        };
-        disc.manifest.updatedAt = new Date().toISOString();
-
-        // Upload initial account + any existing local slots
-        const filesPayload: Record<string, { content: string }> = {
-          [MANIFEST_FILENAME]: { content: JSON.stringify(disc.manifest, null, 2) },
-        };
-        for (const c of localList) {
-          const full = await loadCityLocally(accountId, c.slotId);
-          if (full) {
-            filesPayload[slotGistFilename(accountId, c.slotId)] = {
-              content: JSON.stringify(full),
-            };
-          }
-        }
-
-        try {
-          const patchRes = await fetch(
-            `https://api.github.com/gists/${encodeURIComponent(disc.gist.id)}`,
-            {
-              method: 'PATCH',
-              headers: githubHeaders(pat, { 'Content-Type': 'application/json' }),
-              body: JSON.stringify({ files: filesPayload }),
-            }
-          );
-          if (patchRes.ok) {
-            cachedGistPayload = (await patchRes.json()) as GistApiResponse;
-            cachedManifest = disc.manifest;
-            saveCloudConfig({
-              lastEtag: patchRes.headers.get('ETag') || '',
-              lastSyncedAt: new Date().toISOString(),
-            });
-          }
-        } catch {
-          // stays safe locally
-        }
-
-        const session: AuthSessionData = {
-          token: `gist.${accountId}`,
-          accountId,
-          mayorName: cleanMayor,
-        };
-        saveAuthSession(session);
-        return { ok: true, session, cities: localList };
-      }
-    }
-  }
-
-  // Path B: Pure Local / Offline Instant Mode (zero server needed)
-  let localAcc = localAccounts[accountId];
-  if (localAcc) {
-    if (sha256Hex(`${localAcc.salt}:${cleanPass}`) !== localAcc.passHash) {
-      return {
-        ok: false,
-        session: { token: '', accountId: '', mayorName: cleanMayor },
-        cities: [],
-        error: 'Contraseña incorrecta para este perfil local.',
-      };
-    }
-  } else {
-    const salt = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-    localAcc = {
-      mayorName: cleanMayor,
-      salt,
-      passHash: sha256Hex(`${salt}:${cleanPass}`),
-      createdAt: new Date().toISOString(),
+  if (sha256Hex(`foxcity_ui_gate_v1:${cleanPass}`) !== EXPECTED_UI_GATE_HASH) {
+    return {
+      ok: false,
+      session: { token: '', accountId: DEFAULT_ACCOUNT_ID, mayorName: DEFAULT_MAYOR_NAME },
+      cities: [],
+      error: 'Contraseña incorrecta.',
     };
-    localAccounts[accountId] = localAcc;
-    saveLocalAccounts(localAccounts);
   }
 
+  const rpcKey = sha256Hex(`foxcity_cloud_rpc_v1:${cleanPass}`);
   const session: AuthSessionData = {
-    token: `local.${accountId}`,
-    accountId,
-    mayorName: localAcc.mayorName || cleanMayor,
+    token: `rpc.${rpcKey}`,
+    accountId: DEFAULT_ACCOUNT_ID,
+    mayorName: DEFAULT_MAYOR_NAME,
   };
   saveAuthSession(session);
+
   return {
     ok: true,
-    offlineFallback: !pat,
     session,
-    cities: listLocalCities(accountId),
+    cities: listLocalCities(DEFAULT_ACCOUNT_ID),
   };
 }
 
-// Connect or refresh GitHub Token while already logged into the Hub or 3D Game
-export async function connectAndSyncGitHubToken(
-  session: AuthSessionData,
-  patInput: string
-): Promise<{
-  ok: boolean;
-  githubLogin?: string;
-  gistId?: string;
-  cities?: CloudCitySummary[];
-  error?: string;
-}> {
-  const cleanPat = patInput.trim();
-  if (!cleanPat) {
-    return { ok: false, error: 'Pega un Personal Access Token válido de GitHub.' };
-  }
+export async function reconcileWithRemoteCities(
+  accountId: string,
+  remoteList: CloudCitySummary[]
+): Promise<CloudCitySummary[]> {
+  const localList = listLocalCities(accountId);
+  const dirtySet = new Set(hasDirtySlotsForAccount(accountId));
+  const remoteMap = new Map(remoteList.map((r) => [r.slotId, r]));
+  const merged = new Map<string, CloudCitySummary>();
 
-  const disc = await discoverOrCreateFoxCityGist(cleanPat, true);
-  if (!disc.ok || !disc.gist || !disc.manifest) {
-    return { ok: false, error: disc.error || 'No se pudo conectar con GitHub Gist.' };
-  }
-
-  const localAccounts = loadLocalAccounts();
-  const localAcc = localAccounts[session.accountId];
-  let accBlock = disc.manifest.accounts[session.accountId];
-
-  if (!accBlock) {
-    const fallbackSalt = `${Date.now().toString(36)}-sync`;
-    accBlock = {
-      mayorName: session.mayorName,
-      salt: localAcc?.salt || fallbackSalt,
-      passHash: localAcc?.passHash || sha256Hex(`${fallbackSalt}:foxcity`),
-      createdAt: localAcc?.createdAt || new Date().toISOString(),
-      cities: {},
-    };
-    disc.manifest.accounts[session.accountId] = accBlock;
-  } else {
-    // Adopt canonical salt/hash from Gist so both devices stay aligned
-    localAccounts[session.accountId] = {
-      mayorName: accBlock.mayorName || session.mayorName,
-      salt: accBlock.salt,
-      passHash: accBlock.passHash,
-      createdAt: accBlock.createdAt,
-    };
-    saveLocalAccounts(localAccounts);
-  }
-
-  // Merge local cities that are newer or missing on Gist
-  const localList = listLocalCities(session.accountId);
-  const filesToPatch: Record<string, { content: string }> = {};
-  let needsPatch = false;
-
-  for (const locSummary of localList) {
-    const remSummary = accBlock.cities[locSummary.slotId];
-    if (!remSummary || (locSummary.serverRev || 0) > (remSummary.serverRev || 0)) {
-      const fullLocal = await loadCityLocally(session.accountId, locSummary.slotId);
-      if (fullLocal) {
-        const nextRev = Math.max(locSummary.serverRev || 0, remSummary?.serverRev || 0) + 1;
-        const cleanRec: LocalSavedCityRecord = {
-          ...fullLocal,
-          serverRev: nextRev,
-          dirtyOffline: false,
-        };
-        const { compactState: _cs, dirtyOffline: _do, ...summary } = cleanRec;
-        accBlock.cities[locSummary.slotId] = summary;
-        filesToPatch[slotGistFilename(session.accountId, locSummary.slotId)] = {
-          content: JSON.stringify(cleanRec),
-        };
-        await saveCityLocally(session.accountId, cleanRec);
-        needsPatch = true;
+  for (const loc of localList) {
+    if (!remoteMap.has(loc.slotId)) {
+      if ((loc.serverRev || 0) === 0 || dirtySet.has(loc.slotId)) {
+        merged.set(loc.slotId, loc);
+      } else {
+        await removeCityLocally(accountId, loc.slotId);
       }
+    } else {
+      merged.set(loc.slotId, loc);
     }
   }
 
-  if (needsPatch || Object.keys(filesToPatch).length > 0) {
-    disc.manifest.updatedAt = new Date().toISOString();
-    filesToPatch[MANIFEST_FILENAME] = {
-      content: JSON.stringify(disc.manifest, null, 2),
-    };
-    try {
-      const patchRes = await fetch(
-        `https://api.github.com/gists/${encodeURIComponent(disc.gist.id)}`,
-        {
-          method: 'PATCH',
-          headers: githubHeaders(cleanPat, { 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ files: filesToPatch }),
-        }
-      );
-      if (patchRes.ok) {
-        cachedGistPayload = (await patchRes.json()) as GistApiResponse;
-        cachedManifest = disc.manifest;
-        saveCloudConfig({
-          lastEtag: patchRes.headers.get('ETag') || '',
-          lastSyncedAt: new Date().toISOString(),
-        });
-      }
-    } catch {
-      // ignore
+  for (const r of remoteList) {
+    const loc = merged.get(r.slotId);
+    if (!loc || (!dirtySet.has(r.slotId) && r.serverRev >= (loc.serverRev || 0))) {
+      merged.set(r.slotId, { ...r, mapId: r.mapId as MapArchetypeId });
     }
   }
 
-  const merged = mergeCityLists(
-    listLocalCities(session.accountId),
-    Object.values(accBlock.cities || {})
+  const sorted = Array.from(merged.values()).sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
   );
-  saveLocalIndex(session.accountId, merged);
-
-  const updatedSession: AuthSessionData = {
-    ...session,
-    token: `gist.${session.accountId}`,
-  };
-  saveAuthSession(updatedSession);
-
-  const cfg = getCloudConfig();
-  return {
-    ok: true,
-    githubLogin: cfg.githubLogin,
-    gistId: cfg.gistId,
-    cities: merged,
-  };
+  saveLocalIndex(accountId, sorted);
+  setLastCloudSyncTime(new Date().toISOString());
+  return sorted;
 }
 
 export async function fetchCloudCitySummaries(
   session: AuthSessionData
 ): Promise<CloudCitySummary[] | null> {
   await hydrateEmergencyWalIfAny();
-  const pat = getCloudConfig().pat;
-  if (!pat) return listLocalCities(session.accountId);
+  const rpcKey = extractRpcKey(session);
+  if (!rpcKey) return null;
 
-  const disc = await discoverOrCreateFoxCityGist(pat, false);
-  if (!disc.ok || !disc.manifest) return null;
+  const { status, data } = await postFoxCityRpc<{
+    ok?: boolean;
+    cities?: CloudCitySummary[];
+  }>('/list', {
+    rpcKey,
+    accountId: session.accountId,
+  });
 
-  const remoteCities = Object.values(disc.manifest.accounts[session.accountId]?.cities || {});
-  const merged = mergeCityLists(listLocalCities(session.accountId), remoteCities);
-  saveLocalIndex(session.accountId, merged);
-  return merged;
+  if (status === 200 && data?.ok && Array.isArray(data.cities)) {
+    return await reconcileWithRemoteCities(session.accountId, data.cities);
+  }
+  return null;
 }
 
 export async function fetchCloudCityFull(
@@ -1118,46 +579,29 @@ export async function fetchCloudCityFull(
   slotId: string
 ): Promise<LocalSavedCityRecord | null> {
   const localRec = await loadCityLocally(session.accountId, slotId);
-  const pat = getCloudConfig().pat;
-  if (!pat) return localRec;
+  const rpcKey = extractRpcKey(session);
+  if (!rpcKey) return localRec;
 
-  const disc = await discoverOrCreateFoxCityGist(pat, false);
-  if (!disc.ok || !disc.gist || !disc.manifest) return localRec;
+  const { status, data } = await postFoxCityRpc<{
+    ok?: boolean;
+    city?: LocalSavedCityRecord | null;
+  }>('/get', {
+    rpcKey,
+    accountId: session.accountId,
+    slotId,
+  });
 
-  const remMeta = disc.manifest.accounts[session.accountId]?.cities?.[slotId];
-  if (!remMeta) return localRec;
-
-  // If local already has equal/newer revision or unsynced offline edits, avoid extra download
-  if (localRec && (localRec.dirtyOffline || localRec.serverRev >= remMeta.serverRev)) {
-    return localRec;
-  }
-
-  const slotFilename = slotGistFilename(session.accountId, slotId);
-  let fileDesc = disc.gist.files?.[slotFilename];
-
-  // If cached gist response came from 304 without fresh file body, fetch fresh gist
-  if (!fileDesc) {
-    const fresh = await discoverOrCreateFoxCityGist(pat, true);
-    if (fresh.ok && fresh.gist) {
-      fileDesc = fresh.gist.files?.[slotFilename];
-    }
-  }
-
-  const rawText = await readGistFileText(fileDesc);
-  if (!rawText) return localRec;
-
-  try {
-    const remoteRec = JSON.parse(rawText) as LocalSavedCityRecord;
-    if (remoteRec?.compactState) {
+  if (status === 200 && data?.ok && data.city) {
+    const remote = data.city;
+    if (!localRec || (!localRec.dirtyOffline && remote.serverRev >= (localRec.serverRev || 0))) {
       const cleanRemote: LocalSavedCityRecord = {
-        ...remoteRec,
+        ...remote,
         dirtyOffline: false,
       };
       await saveCityLocally(session.accountId, cleanRemote);
+      setLastCloudSyncTime(new Date().toISOString());
       return cleanRemote;
     }
-  } catch {
-    // fallback to local
   }
   return localRec;
 }
@@ -1185,159 +629,64 @@ export async function pushCityToCloud(
   }
   await saveCityLocally(session.accountId, dirtyRecord);
 
-  const pat = getCloudConfig().pat;
-  if (!pat) {
+  const rpcKey = extractRpcKey(session);
+  if (!rpcKey) {
     return { status: 'offline', cities: listLocalCities(session.accountId) };
   }
 
   return runSerialized(async () => {
-    const disc = await discoverOrCreateFoxCityGist(pat, false);
-    if (!disc.ok || !disc.gist || !disc.manifest) {
-      return { status: 'offline', cities: listLocalCities(session.accountId) };
-    }
+    const { status, data } = await postFoxCityRpc<{
+      ok?: boolean;
+      conflict?: boolean;
+      serverRev?: number;
+      updatedAt?: string;
+      serverCity?: LocalSavedCityRecord;
+      backupSlotId?: string | null;
+      cities?: CloudCitySummary[];
+    }>(
+      '/sync',
+      {
+        rpcKey,
+        accountId: session.accountId,
+        slotId: record.slotId,
+        baseRev: record.serverRev || 0,
+        deviceId,
+        forceOverwrite: Boolean(options?.forceOverwrite),
+        city: record,
+      },
+      { keepalive: options?.keepalive }
+    );
 
-    const manifest = disc.manifest;
-    const localAccounts = loadLocalAccounts();
-    const localAcc = localAccounts[session.accountId];
-
-    if (!manifest.accounts[session.accountId]) {
-      const salt = localAcc?.salt || `${Date.now().toString(36)}-auto`;
-      manifest.accounts[session.accountId] = {
-        mayorName: session.mayorName,
-        salt,
-        passHash: localAcc?.passHash || sha256Hex(`${salt}:foxcity`),
-        createdAt: localAcc?.createdAt || new Date().toISOString(),
-        cities: {},
+    if (status === 409 && data?.conflict && data.serverCity) {
+      const reconciled = data.cities
+        ? await reconcileWithRemoteCities(session.accountId, data.cities)
+        : listLocalCities(session.accountId);
+      return {
+        status: 'conflict',
+        serverCity: data.serverCity,
+        backupSlotId: data.backupSlotId,
+        cities: reconciled,
       };
     }
 
-    const accBlock = manifest.accounts[session.accountId];
-    const remoteMeta = accBlock.cities[record.slotId];
-
-    // Conflict Check: another device saved a strictly newer revision while we were offline
-    if (
-      remoteMeta &&
-      remoteMeta.serverRev > (record.serverRev || 0) &&
-      remoteMeta.deviceId !== deviceId &&
-      !options?.forceOverwrite
-    ) {
-      const remoteFile = disc.gist.files?.[slotGistFilename(session.accountId, record.slotId)];
-      const remoteText = await readGistFileText(remoteFile);
-      if (remoteText) {
-        try {
-          const remoteFull = JSON.parse(remoteText) as LocalSavedCityRecord;
-          // Auto-backup local progress into a separate safe slot so zero work is ever lost
-          const backupSlotId = `${record.slotId}-bkp-${Date.now().toString(36).slice(-4)}`;
-          const backupRec: LocalSavedCityRecord = {
-            ...record,
-            slotId: backupSlotId,
-            name: `${record.name} (Respaldo Local)`,
-            serverRev: 1,
-            updatedAt: new Date().toISOString(),
-            deviceId,
-            dirtyOffline: false,
-          };
-          await saveCityLocally(session.accountId, backupRec);
-          const { compactState: _cs, dirtyOffline: _do, ...bkpSummary } = backupRec;
-          accBlock.cities[backupSlotId] = bkpSummary;
-          manifest.updatedAt = new Date().toISOString();
-
-          await fetch(`https://api.github.com/gists/${encodeURIComponent(disc.gist.id)}`, {
-            method: 'PATCH',
-            headers: githubHeaders(pat, { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({
-              files: {
-                [MANIFEST_FILENAME]: { content: JSON.stringify(manifest, null, 2) },
-                [slotGistFilename(session.accountId, backupSlotId)]: {
-                  content: JSON.stringify(backupRec),
-                },
-              },
-            }),
-          }).catch(() => undefined);
-
-          const merged = mergeCityLists(
-            listLocalCities(session.accountId),
-            Object.values(accBlock.cities)
-          );
-          saveLocalIndex(session.accountId, merged);
-
-          return {
-            status: 'conflict',
-            serverCity: remoteFull,
-            backupSlotId,
-            cities: merged,
-          };
-        } catch {
-          // proceed if remote file unreadable
-        }
-      }
-    }
-
-    const nextRev = Math.max(record.serverRev || 0, remoteMeta?.serverRev || 0) + 1;
-    const nowIso = new Date().toISOString();
-    const syncedRecord: LocalSavedCityRecord = {
-      ...record,
-      serverRev: nextRev,
-      updatedAt: nowIso,
-      deviceId,
-      dirtyOffline: false,
-    };
-
-    const { compactState: _cs, dirtyOffline: _do, ...summary } = syncedRecord;
-    accBlock.cities[record.slotId] = summary;
-    manifest.updatedAt = nowIso;
-
-    const patchBody = JSON.stringify({
-      files: {
-        [MANIFEST_FILENAME]: {
-          content: JSON.stringify(manifest, null, 2),
-        },
-        [slotGistFilename(session.accountId, record.slotId)]: {
-          content: JSON.stringify(syncedRecord),
-        },
-      },
-    });
-
-    // Guard hard 64 KiB WebKit/Chromium fetch keepalive ceiling
-    const byteLength = new TextEncoder().encode(patchBody).byteLength;
-    const safeKeepalive = Boolean(options?.keepalive) && byteLength < 60000;
-
-    try {
-      const res = await fetch(
-        `https://api.github.com/gists/${encodeURIComponent(disc.gist.id)}`,
-        {
-          method: 'PATCH',
-          keepalive: safeKeepalive,
-          headers: githubHeaders(pat, { 'Content-Type': 'application/json' }),
-          body: patchBody,
-        }
-      );
-
-      if (res.ok) {
-        const updatedGist = (await res.json()) as GistApiResponse;
-        const etag = res.headers.get('ETag') || '';
-        cachedGistPayload = updatedGist;
-        cachedManifest = manifest;
-        saveCloudConfig({
-          lastEtag: etag,
-          lastSyncedAt: nowIso,
-        });
-
-        await saveCityLocally(session.accountId, syncedRecord);
-        const merged = mergeCityLists(
-          listLocalCities(session.accountId),
-          Object.values(accBlock.cities)
-        );
-        saveLocalIndex(session.accountId, merged);
-
-        return {
-          status: 'synced',
-          serverRev: nextRev,
-          cities: merged,
-        };
-      }
-    } catch {
-      // remains marked dirty in IndexedDB + dirty_slots for automatic flush on resume
+    if (status === 200 && data?.ok) {
+      const syncedRec: LocalSavedCityRecord = {
+        ...record,
+        serverRev: data.serverRev ?? (record.serverRev || 0) + 1,
+        updatedAt: data.updatedAt || new Date().toISOString(),
+        deviceId,
+        dirtyOffline: false,
+      };
+      await saveCityLocally(session.accountId, syncedRec);
+      const reconciled = data.cities
+        ? await reconcileWithRemoteCities(session.accountId, data.cities)
+        : listLocalCities(session.accountId);
+      setLastCloudSyncTime(new Date().toISOString());
+      return {
+        status: 'synced',
+        serverRev: syncedRec.serverRev,
+        cities: reconciled,
+      };
     }
 
     return { status: 'offline', cities: listLocalCities(session.accountId) };
@@ -1345,7 +694,7 @@ export async function pushCityToCloud(
 }
 
 export async function flushPendingDirtySlots(session: AuthSessionData): Promise<void> {
-  if (!getCloudConfig().pat) return;
+  if (!extractRpcKey(session)) return;
   const dirtySlotIds = hasDirtySlotsForAccount(session.accountId);
   for (const slotId of dirtySlotIds) {
     const rec = await loadCityLocally(session.accountId, slotId);
@@ -1362,52 +711,26 @@ export async function deleteCityEverywhere(
   slotId: string
 ): Promise<CloudCitySummary[]> {
   await removeCityLocally(session.accountId, slotId);
-
-  const pat = getCloudConfig().pat;
-  if (pat) {
+  const rpcKey = extractRpcKey(session);
+  if (rpcKey) {
     await runSerialized(async () => {
-      const disc = await discoverOrCreateFoxCityGist(pat, false);
-      if (disc.ok && disc.gist && disc.manifest) {
-        const accBlock = disc.manifest.accounts[session.accountId];
-        if (accBlock?.cities?.[slotId]) {
-          delete accBlock.cities[slotId];
-          disc.manifest.updatedAt = new Date().toISOString();
-          try {
-            const res = await fetch(
-              `https://api.github.com/gists/${encodeURIComponent(disc.gist.id)}`,
-              {
-                method: 'PATCH',
-                headers: githubHeaders(pat, { 'Content-Type': 'application/json' }),
-                body: JSON.stringify({
-                  files: {
-                    [MANIFEST_FILENAME]: {
-                      content: JSON.stringify(disc.manifest, null, 2),
-                    },
-                    [slotGistFilename(session.accountId, slotId)]: null,
-                  },
-                }),
-              }
-            );
-            if (res.ok) {
-              cachedGistPayload = (await res.json()) as GistApiResponse;
-              cachedManifest = disc.manifest;
-              saveCloudConfig({
-                lastEtag: res.headers.get('ETag') || '',
-                lastSyncedAt: new Date().toISOString(),
-              });
-            }
-          } catch {
-            // ignore
-          }
-        }
+      const { status, data } = await postFoxCityRpc<{
+        ok?: boolean;
+        cities?: CloudCitySummary[];
+      }>('/delete', {
+        rpcKey,
+        accountId: session.accountId,
+        slotId,
+      });
+      if (status === 200 && data?.ok && Array.isArray(data.cities)) {
+        await reconcileWithRemoteCities(session.accountId, data.cities);
       }
     });
   }
-
   return listLocalCities(session.accountId);
 }
 
-// --- Universal JSON Backup Export & Import (Works 100% with or without GitHub Token) ---
+// --- Universal JSON Backup Export & Import ---
 export async function exportAccountBackupJson(session: AuthSessionData): Promise<void> {
   const summaries = listLocalCities(session.accountId);
   const fullRecords: LocalSavedCityRecord[] = [];
@@ -1468,9 +791,7 @@ export async function importAccountBackupJson(
         updatedAt: new Date().toISOString(),
       };
       await saveCityLocally(session.accountId, rec);
-      if (isGitHubCloudEnabled()) {
-        await pushCityToCloud(session, rec, { forceOverwrite: true });
-      }
+      await pushCityToCloud(session, rec, { forceOverwrite: true });
     }
 
     return {

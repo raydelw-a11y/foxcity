@@ -1,43 +1,23 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  Building2,
-  ChevronDown,
-  ChevronUp,
-  Cloud,
-  ExternalLink,
-  KeyRound,
-  Lock,
-  Sparkles,
-  User,
-} from 'lucide-react';
+import { Building2, Cloud, Lock, Sparkles } from 'lucide-react';
 import { soundFX } from '../audio/soundEngine';
-import { getCloudConfig } from '../utils/cloudSync';
+import { prewarmCloudGateway } from '../utils/cloudSync';
 
 interface PrivateAccessProps {
   buildTimestamp: string;
-  onUnlock: (
-    mayorName: string,
-    password: string,
-    optionalGithubPat?: string
-  ) => Promise<{ ok: boolean; error?: string }>;
+  onUnlock: (password: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
 export const PrivateAccess: React.FC<PrivateAccessProps> = ({ buildTimestamp, onUnlock }) => {
-  const [mayorName, setMayorName] = useState(() => {
-    try {
-      return localStorage.getItem('foxcity:last_mayor') || 'Raydel';
-    } catch {
-      return 'Raydel';
-    }
-  });
   const [password, setPassword] = useState('');
-  const [githubPat, setGithubPat] = useState(() => getCloudConfig().pat);
-  const [showCloudField, setShowCloudField] = useState(() => false);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const hasSavedPat = Boolean(getCloudConfig().pat);
+  // Pre-warm remote cloud gateway immediately while user types password
+  useEffect(() => {
+    prewarmCloudGateway();
+  }, []);
 
   // Animated Modern Night Skyline Backdrop with Bridge & Moving Headlights
   useEffect(() => {
@@ -139,16 +119,11 @@ export const PrivateAccess: React.FC<PrivateAccessProps> = ({ buildTimestamp, on
     setLoading(true);
     soundFX.unlock();
 
-    try {
-      localStorage.setItem('foxcity:last_mayor', mayorName.trim() || 'Raydel');
-    } catch {
-      // ignore
-    }
-
-    const res = await onUnlock(mayorName.trim() || 'Raydel', cleanPass, githubPat.trim() || undefined);
+    const res = await onUnlock(cleanPass);
     setLoading(false);
     if (!res.ok) {
       setErrorMsg(res.error || 'Contraseña incorrecta.');
+      setPassword('');
     } else {
       soundFX.playMilestoneFanfare();
     }
@@ -160,7 +135,7 @@ export const PrivateAccess: React.FC<PrivateAccessProps> = ({ buildTimestamp, on
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
+    if (e.key === 'Enter' || e.key === 'NumpadEnter') {
       e.preventDefault();
       void submitAccess();
     }
@@ -183,29 +158,12 @@ export const PrivateAccess: React.FC<PrivateAccessProps> = ({ buildTimestamp, on
           </div>
         </div>
 
-        <p className="text-xs sm:text-sm text-slate-300 mb-4 leading-relaxed">
-          Simulador metropolitano 3D en GitHub Pages con auto-sincronización entre escritorio,
-          iPhone, iPad y Android.
+        <p className="text-xs sm:text-sm text-slate-300 mb-5 leading-relaxed">
+          Simulador metropolitano 3D con guardado automático en la nube entre escritorio, iPhone,
+          iPad y Android.
         </p>
 
-        <form onSubmit={handleSubmit} className="space-y-3.5">
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              Perfil de Alcalde (mismo nombre en todos tus equipos)
-            </label>
-            <div className="relative">
-              <User className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={mayorName}
-                onChange={(e) => setMayorName(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Tu nombre o usuario"
-                className="w-full pl-10 pr-3.5 py-2.5 rounded-xl bg-slate-950/80 border border-slate-700/80 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-400 transition"
-              />
-            </div>
-          </div>
-
+        <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1.5">
               Contraseña de Acceso Privado
@@ -215,69 +173,27 @@ export const PrivateAccess: React.FC<PrivateAccessProps> = ({ buildTimestamp, on
               <input
                 type="password"
                 autoFocus
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                autoComplete="current-password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (errorMsg) setErrorMsg('');
+                }}
                 onKeyDown={handleKeyDown}
-                placeholder="Ingresa tu clave y pulsa Enter..."
+                placeholder="Ingresa tu contraseña y pulsa Enter..."
                 className="w-full pl-10 pr-3.5 py-2.5 rounded-xl bg-slate-950/80 border border-slate-700/80 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-400 transition"
               />
             </div>
           </div>
 
-          {/* Optional Collapsible GitHub Cloud Sync Accordion */}
-          <div className="rounded-2xl bg-slate-950/65 border border-slate-800 px-3.5 py-2.5">
-            <button
-              type="button"
-              onClick={() => setShowCloudField((v) => !v)}
-              className="w-full flex items-center justify-between text-left text-xs font-bold text-sky-300 cursor-pointer"
-            >
-              <span className="flex items-center gap-1.5">
-                <Cloud className="w-3.5 h-3.5 text-sky-400" />
-                {hasSavedPat
-                  ? 'Nube GitHub Vinculada (Auto-Sync Activo)'
-                  : 'Sincronizar con GitHub Cloud (Opcional)'}
-              </span>
-              {showCloudField ? (
-                <ChevronUp className="w-4 h-4 text-slate-400" />
-              ) : (
-                <ChevronDown className="w-4 h-4 text-slate-400" />
-              )}
-            </button>
-
-            {showCloudField && (
-              <div className="mt-2.5 space-y-2 pt-2 border-t border-slate-800/80">
-                <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <span className="inline-flex items-center gap-1">
-                    <KeyRound className="w-3 h-3 text-sky-400" /> Token con permiso{' '}
-                    <code className="text-sky-300">gist</code>
-                  </span>
-                  <a
-                    href="https://github.com/settings/tokens/new?scopes=gist&description=FoxCity-CloudSync"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-sky-400 hover:text-sky-300 font-bold inline-flex items-center gap-1"
-                  >
-                    Crear en 1 clic <ExternalLink className="w-3 h-3" />
-                  </a>
-                </div>
-                <input
-                  type="password"
-                  value={githubPat}
-                  onChange={(e) => setGithubPat(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder="ghp_... (o déjalo vacío para jugar local)"
-                  className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-400"
-                />
-                <p className="text-[10px] text-slate-400 leading-relaxed">
-                  Solo se pega una vez por dispositivo. Descubre tu Gist secreto automáticamente sin
-                  pedir IDs. También puedes configurarlo luego dentro del juego.
-                </p>
-              </div>
-            )}
-          </div>
-
           {errorMsg && (
-            <div className="text-xs font-semibold text-rose-300 bg-rose-950/60 border border-rose-500/40 rounded-xl px-3 py-2">
+            <div
+              role="alert"
+              className="text-xs font-semibold text-rose-300 bg-rose-950/60 border border-rose-500/40 rounded-xl px-3 py-2"
+            >
               {errorMsg}
             </div>
           )}

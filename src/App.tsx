@@ -68,7 +68,6 @@ import {
   flushPendingDirtySlots,
   getOrCreateDeviceId,
   hydrateEmergencyWalIfAny,
-  isGitHubCloudEnabled,
   listLocalCities,
   LocalSavedCityRecord,
   loadSavedSession,
@@ -77,7 +76,7 @@ import {
   writeEmergencyWalSync,
 } from './utils/cloudSync';
 
-const FALLBACK_BUILD_TIMESTAMP = '12:41 PM - 11/12/2026';
+const FALLBACK_BUILD_TIMESTAMP = '5:17 PM - 11/12/2026';
 const BUILD_TS =
   typeof __BUILD_TIMESTAMP__ !== 'undefined' ? __BUILD_TIMESTAMP__ : FALLBACK_BUILD_TIMESTAMP;
 
@@ -122,9 +121,7 @@ export const App: React.FC = () => {
   const [showCloudModal, setShowCloudModal] = useState(false);
   const [muted, setMuted] = useState(false);
 
-  const [syncState, setSyncState] = useState<'synced' | 'saving' | 'offline' | 'conflict'>(() =>
-    isGitHubCloudEnabled() ? 'synced' : 'offline'
-  );
+  const [syncState, setSyncState] = useState<'synced' | 'saving' | 'offline' | 'conflict'>('synced');
   const debouncePushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [conflictData, setConflictData] = useState<{
     serverCity: LocalSavedCityRecord;
@@ -145,13 +142,35 @@ export const App: React.FC = () => {
   // Refresh cloud city list & flush any pending offline slots when session is active
   useEffect(() => {
     if (!session) return;
-    void (async () => {
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const runInitialCloudSync = async (allowRetry: boolean) => {
       await hydrateEmergencyWalIfAny();
-      await flushPendingDirtySlots(session);
       const remote = await fetchCloudCitySummaries(session);
-      if (remote) setCities(remote);
-      setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
-    })();
+      if (cancelled) return;
+      if (remote) {
+        setCities(remote);
+        await flushPendingDirtySlots(session);
+        const refreshed = await fetchCloudCitySummaries(session);
+        if (cancelled) return;
+        if (refreshed) setCities(refreshed);
+        setSyncState('synced');
+      } else {
+        setSyncState('offline');
+        if (allowRetry) {
+          retryTimer = setTimeout(() => {
+            void runInitialCloudSync(false);
+          }, 12000);
+        }
+      }
+    };
+
+    void runInitialCloudSync(true);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
   }, [session]);
 
   const refreshHud = useCallback(() => {
@@ -250,7 +269,7 @@ export const App: React.FC = () => {
         void syncNow({ keepalive: true });
       } else if (document.visibilityState === 'visible') {
         void flushPendingDirtySlots(session);
-        if (engineRef.current && !engineRef.current.dirtySync && isGitHubCloudEnabled()) {
+        if (engineRef.current && !engineRef.current.dirtySync) {
           // Check if another device saved newer progress while this tab was sleeping
           const curId = engineRef.current.cityId;
           void fetchCloudCityFull(session, curId).then((latest) => {
@@ -292,21 +311,17 @@ export const App: React.FC = () => {
     };
   }, [buildSaveRecord, inHub, refreshHud, session, showToast, syncNow]);
 
-  const handleUnlock = async (
-    mayorName: string,
-    password: string,
-    optionalGithubPat?: string
-  ) => {
+  const handleUnlock = async (password: string) => {
     const clean = password.trim();
     if (clean.length < 2) {
       return { ok: false, error: 'La contraseña debe tener al menos 2 caracteres.' };
     }
-    const res = await authenticateWithServer(mayorName, clean, optionalGithubPat);
+    const res = await authenticateWithServer(clean);
     if (!res.ok) return { ok: false, error: res.error };
 
     setSession(res.session);
     setCities(res.cities);
-    setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
+    setSyncState('synced');
     setInHub(true);
     return { ok: true };
   };
@@ -361,20 +376,16 @@ export const App: React.FC = () => {
     if (session && engineRef.current) {
       const rec = buildSaveRecord();
       if (rec) {
-        // Instant local IndexedDB persistence (0 network stall) + debounced GitHub Gist sync
+        // Instant local IndexedDB persistence (0 network stall) + debounced automatic cloud sync
         void saveCityLocally(session.accountId, { ...rec, dirtyOffline: true }).then(() => {
           setCities(listLocalCities(session.accountId));
         });
-        if (isGitHubCloudEnabled()) {
-          if (debouncePushRef.current) clearTimeout(debouncePushRef.current);
-          const delayMs = window.matchMedia('(pointer: coarse)').matches ? 4000 : 7000;
-          debouncePushRef.current = setTimeout(() => {
-            debouncePushRef.current = null;
-            void syncNow();
-          }, delayMs);
-        } else {
-          setSyncState('offline');
-        }
+        if (debouncePushRef.current) clearTimeout(debouncePushRef.current);
+        const delayMs = window.matchMedia('(pointer: coarse)').matches ? 4000 : 7000;
+        debouncePushRef.current = setTimeout(() => {
+          debouncePushRef.current = null;
+          void syncNow();
+        }, delayMs);
       }
     }
   }, [buildSaveRecord, refreshHud, session, syncNow]);
@@ -452,10 +463,8 @@ export const App: React.FC = () => {
                   FOX CITY
                 </h1>
                 <p className="text-xs sm:text-sm text-sky-300 font-medium flex items-center gap-1.5">
-                  <Cloud className="w-3.5 h-3.5" /> Alcalde {session.mayorName} •{' '}
-                  {isGitHubCloudEnabled()
-                    ? 'Sincronización GitHub Gist Activa'
-                    : 'Modo Local (Conecta GitHub Cloud para multi-dispositivo)'}
+                  <Cloud className="w-3.5 h-3.5" /> Cuenta {session.mayorName} • Sincronización
+                  Automática en la Nube Activa
                 </p>
               </div>
             </div>
@@ -464,14 +473,10 @@ export const App: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setShowCloudModal(true)}
-                className={`px-3.5 py-2 rounded-xl border text-xs font-extrabold flex items-center gap-1.5 cursor-pointer ${
-                  isGitHubCloudEnabled()
-                    ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-400/50 text-emerald-200'
-                    : 'bg-sky-500/15 hover:bg-sky-500/25 border-sky-400/50 text-sky-200'
-                }`}
+                className="px-3.5 py-2 rounded-xl border text-xs font-extrabold flex items-center gap-1.5 cursor-pointer bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-400/50 text-emerald-200"
               >
                 <Cloud className="w-3.5 h-3.5" />
-                {isGitHubCloudEnabled() ? 'Nube GitHub Activa' : 'Conectar Nube / Respaldo'}
+                Nube y Respaldo
               </button>
 
               <button
@@ -681,7 +686,7 @@ export const App: React.FC = () => {
             onClose={() => setShowCloudModal(false)}
             onCitiesUpdated={(next) => {
               setCities(next);
-              setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
+              setSyncState('synced');
             }}
             onToast={showToast}
           />
@@ -918,10 +923,12 @@ export const App: React.FC = () => {
               onClick={() => setShowCloudModal(true)}
               title={
                 syncState === 'synced'
-                  ? 'Nube GitHub sincronizada (toca para opciones/respaldo)'
+                  ? 'Sincronizado en la nube (toca para opciones/respaldo)'
                   : syncState === 'saving'
-                  ? 'Guardando en GitHub Gist...'
-                  : 'Modo Local (toca para conectar GitHub Cloud o exportar JSON)'
+                  ? 'Guardando en la nube...'
+                  : syncState === 'conflict'
+                  ? 'Conflicto detectado (toca para resolver)'
+                  : 'Modo local (reintentando conexión automático)'
               }
               className="px-2 py-1 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 flex items-center gap-1.5 text-[10px] font-bold cursor-pointer"
             >
@@ -1894,7 +1901,7 @@ export const App: React.FC = () => {
           onClose={() => setShowCloudModal(false)}
           onCitiesUpdated={(next) => {
             setCities(next);
-            setSyncState(isGitHubCloudEnabled() ? 'synced' : 'offline');
+            setSyncState('synced');
           }}
           onForcePushActiveCity={async () => {
             await syncNow({ forceOverwrite: true });
