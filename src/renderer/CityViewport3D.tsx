@@ -19,10 +19,9 @@ import { getCityProceduralAssets } from './textureAtlas';
 const _dummy = new THREE.Object3D();
 const _dummy2 = new THREE.Object3D();
 const _color = new THREE.Color();
-const _vecA = new THREE.Vector3();
-const _vecB = new THREE.Vector3();
-const WORLD_CENTER = GRID_SIZE * 0.5;
-const WORLD_SPHERE = new THREE.Sphere(new THREE.Vector3(WORLD_CENTER, 0, WORLD_CENTER), 140);
+const TERRAIN_SPAN = GRID_SIZE - 1; // 107 spans for 108 vertices so spacing is exact 1.0
+const TERRAIN_CENTER = TERRAIN_SPAN * 0.5; // 53.5
+const WORLD_SPHERE = new THREE.Sphere(new THREE.Vector3(TERRAIN_CENTER, 0, TERRAIN_CENTER), 145);
 
 export interface PendingMobilePlacement {
   buildingId: SpecialBuildingId;
@@ -59,11 +58,64 @@ interface CityViewport3DProps {
 interface VehicleAgent {
   x: number;
   z: number;
+  nx: number;
+  nz: number;
   dirIdx: number;
   progress: number;
   speed: number;
   kind: 'car' | 'truck' | 'police' | 'fire';
   colorHex: number;
+}
+
+function getCenteredFootprintOrigin(
+  hitX: number,
+  hitZ: number,
+  buildingId: SpecialBuildingId,
+  rotation: 0 | 1 | 2 | 3
+): { x: number; z: number; w: number; d: number } {
+  const spec = BUILDING_SPECS[buildingId];
+  const w = rotation % 2 === 1 ? spec.d : spec.w;
+  const d = rotation % 2 === 1 ? spec.w : spec.d;
+  const x = Math.max(0, Math.min(GRID_SIZE - w, Math.round(hitX - (w - 1) * 0.5)));
+  const z = Math.max(0, Math.min(GRID_SIZE - d, Math.round(hitZ - (d - 1) * 0.5)));
+  return { x, z, w, d };
+}
+
+/** Merges multiple ground-pivoted boxes into a single single-draw-call vehicle BufferGeometry. */
+function createMergedBoxGeometry(
+  parts: { sx: number; sy: number; sz: number; px: number; py: number; pz: number }[]
+): THREE.BufferGeometry {
+  const nonIdxList: THREE.BufferGeometry[] = [];
+  let totalVerts = 0;
+
+  for (const p of parts) {
+    const g = new THREE.BoxGeometry(p.sx, p.sy, p.sz).toNonIndexed();
+    g.translate(p.px, p.py, p.pz);
+    nonIdxList.push(g);
+    totalVerts += g.attributes.position.count;
+  }
+
+  const pos = new Float32Array(totalVerts * 3);
+  const norm = new Float32Array(totalVerts * 3);
+  const uv = new Float32Array(totalVerts * 2);
+
+  let vOffset = 0;
+  for (const g of nonIdxList) {
+    const pArr = g.attributes.position.array as Float32Array;
+    const nArr = g.attributes.normal.array as Float32Array;
+    const uArr = g.attributes.uv.array as Float32Array;
+    pos.set(pArr, vOffset * 3);
+    norm.set(nArr, vOffset * 3);
+    uv.set(uArr, vOffset * 2);
+    vOffset += g.attributes.position.count;
+    g.dispose();
+  }
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(norm, 3));
+  merged.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return merged;
 }
 
 export const CityViewport3D: React.FC<CityViewport3DProps> = ({
@@ -83,7 +135,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
   const [dragBanner, setDragBanner] = useState<LiveDragBanner | null>(null);
   const [touchReticle, setTouchReticle] = useState<{ x: number; y: number } | null>(null);
 
-  // Latest props refs for event listeners & RAF loop without tearing down WebGL scene
   const engineRef = useRef(engine);
   engineRef.current = engine;
   const toolRef = useRef(tool);
@@ -103,7 +154,7 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
     const isMobileTouch = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 820;
 
-    // --- 1. WebGLRenderer & Scene Setup ---
+    // --- 1. WebGLRenderer, Soft PCF Shadows & Atmospheric Sky ---
     const renderer = new THREE.WebGLRenderer({
       antialias: !isMobileTouch,
       powerPreference: 'high-performance',
@@ -111,12 +162,14 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobileTouch ? 1.75 : 2.0));
     renderer.setSize(host.clientWidth, host.clientHeight);
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.08;
+    renderer.toneMappingExposure = 1.06;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#8ecae6');
-    scene.fog = new THREE.FogExp2('#9ad1ea', 0.0042);
+    scene.background = new THREE.Color('#7dd3fc');
+    scene.fog = new THREE.FogExp2('#9ad1ea', 0.0038);
 
     const assets = getCityProceduralAssets(renderer);
     scene.environment = assets.envMap;
@@ -125,36 +178,95 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       44,
       host.clientWidth / Math.max(1, host.clientHeight),
       0.8,
-      360
+      390
     );
 
-    // Smooth Orbital Camera State
     const camState = {
       targetX: 52,
       targetZ: 48,
       yaw: 0.62,
-      pitch: 0.78, // radians above horizon
+      pitch: 0.78,
       distance: isMobileTouch ? 56 : 48,
-      velX: 0,
-      velZ: 0,
     };
 
-    // Lights
-    const hemiLight = new THREE.HemisphereLight('#e0f2fe', '#334155', 0.85);
+    // Sky Dome (vertex-colored zenith -> mid -> horizon gradient updated cleanly with time of day)
+    const skyGeo = new THREE.SphereGeometry(250, 32, 18);
+    const skyPos = skyGeo.attributes.position as THREE.BufferAttribute;
+    const skyColors = new Float32Array(skyPos.count * 3);
+    skyGeo.setAttribute('color', new THREE.BufferAttribute(skyColors, 3));
+    const skyMat = new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.BackSide,
+      fog: false,
+      depthWrite: false,
+    });
+    const skyDomeMesh = new THREE.Mesh(skyGeo, skyMat);
+    skyDomeMesh.position.set(TERRAIN_CENTER, 0, TERRAIN_CENTER);
+    scene.add(skyDomeMesh);
+
+    const zenithCol = new THREE.Color();
+    const horizonCol = new THREE.Color();
+    const midSkyCol = new THREE.Color();
+    let lastSkyKey = '';
+
+    const updateSkyDome = (zenithHex: THREE.Color, horizonHex: THREE.Color) => {
+      const colAttr = skyGeo.attributes.color as THREE.BufferAttribute;
+      for (let idx = 0; idx < skyPos.count; idx++) {
+        const ny = THREE.MathUtils.clamp(skyPos.getY(idx) / 250, 0, 1);
+        const t = Math.pow(ny, 0.58);
+        _color.copy(horizonHex).lerp(zenithHex, t);
+        colAttr.setXYZ(idx, _color.r, _color.g, _color.b);
+      }
+      colAttr.needsUpdate = true;
+    };
+
+    // Lights + Texel-Snapped Soft Shadows
+    const hemiLight = new THREE.HemisphereLight('#e0f2fe', '#334155', 0.78);
     scene.add(hemiLight);
 
-    const sunLight = new THREE.DirectionalLight('#fff7ed', 1.65);
+    const shadowRes = isMobileTouch ? 1024 : 2048;
+    const SHADOW_HALF_EXTENT = 46;
+    const sunLight = new THREE.DirectionalLight('#fff7ed', 1.72);
     sunLight.position.set(85, 95, 35);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.set(shadowRes, shadowRes);
+    sunLight.shadow.camera.near = 4;
+    sunLight.shadow.camera.far = 220;
+    sunLight.shadow.camera.left = -SHADOW_HALF_EXTENT;
+    sunLight.shadow.camera.right = SHADOW_HALF_EXTENT;
+    sunLight.shadow.camera.top = SHADOW_HALF_EXTENT;
+    sunLight.shadow.camera.bottom = -SHADOW_HALF_EXTENT;
+    sunLight.shadow.bias = -0.00045;
+    sunLight.shadow.normalBias = 0.035;
     scene.add(sunLight);
+    scene.add(sunLight.target);
 
-    // --- 2. Terrain Heightfield + Analytical DataTexture ---
-    const terrainGeo = new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE, GRID_SIZE - 1, GRID_SIZE - 1);
+    const fillLight = new THREE.DirectionalLight('#bae6fd', 0.36);
+    fillLight.position.set(-55, 42, -45);
+    scene.add(fillLight);
+
+    // --- 2. Exact 1.0-Unit Terrain Heightfield + Shoreline Foam + Info DataTexture ---
+    const terrainGeo = new THREE.PlaneGeometry(
+      TERRAIN_SPAN,
+      TERRAIN_SPAN,
+      TERRAIN_SPAN,
+      TERRAIN_SPAN
+    );
     terrainGeo.rotateX(-Math.PI / 2);
-    terrainGeo.translate(GRID_SIZE * 0.5 - 0.5, 0, GRID_SIZE * 0.5 - 0.5);
+    terrainGeo.translate(TERRAIN_CENTER, 0, TERRAIN_CENTER);
 
     const vCount = terrainGeo.attributes.position.count;
     const baseColors = new Float32Array(vCount * 3);
     terrainGeo.setAttribute('color', new THREE.BufferAttribute(baseColors, 3));
+
+    // Align terrain UVs to exact cell centers (x + 0.5) / 108 for crisp overlayDataTex alignment
+    const terrainUv = terrainGeo.attributes.uv as THREE.BufferAttribute;
+    for (let z = 0; z < GRID_SIZE; z++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        terrainUv.setXY(z * GRID_SIZE + x, (x + 0.5) / GRID_SIZE, (z + 0.5) / GRID_SIZE);
+      }
+    }
+    terrainUv.needsUpdate = true;
 
     const overlayTexData = new Uint8Array(TOTAL_CELLS * 4);
     const overlayDataTex = new THREE.DataTexture(
@@ -170,7 +282,8 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
     const terrainNormalMat = new THREE.MeshStandardMaterial({
       vertexColors: true,
-      roughness: 0.88,
+      map: assets.terrainDetailTex,
+      roughness: 0.85,
       metalness: 0.04,
       transparent: true,
       opacity: 1,
@@ -187,37 +300,94 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       terrainGeo,
       terrainNormalMat
     );
+    terrainMesh.receiveShadow = true;
     scene.add(terrainMesh);
 
-    // Reflective Water Surface Plane (Y = 0)
-    const waterGeo = new THREE.PlaneGeometry(GRID_SIZE + 80, GRID_SIZE + 80);
+    // Animated Water Plane + Coastal Shoreline Foam Layer
+    const waterGeo = new THREE.PlaneGeometry(GRID_SIZE + 90, GRID_SIZE + 90);
     waterGeo.rotateX(-Math.PI / 2);
-    waterGeo.translate(WORLD_CENTER, -0.04, WORLD_CENTER);
+    waterGeo.translate(TERRAIN_CENTER, -0.04, TERRAIN_CENTER);
     const waterMat = new THREE.MeshStandardMaterial({
       color: '#0284c7',
-      roughness: 0.14,
-      metalness: 0.55,
+      normalMap: assets.waterNormalTex,
+      normalScale: new THREE.Vector2(0.45, 0.45),
+      roughness: 0.09,
+      metalness: 0.62,
       transparent: true,
       opacity: 0.86,
     });
     const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+    waterMesh.receiveShadow = true;
     scene.add(waterMesh);
 
-    // --- 3. Shared Materials (Realistic PBR vs Skylines White Analytical) ---
-    const bldgRealisticMat = new THREE.MeshStandardMaterial({
-      map: assets.facadeAlbedo,
-      emissiveMap: assets.facadeEmissive,
+    const shoreFoamData = new Uint8Array(TOTAL_CELLS * 4);
+    const shoreFoamTex = new THREE.DataTexture(
+      shoreFoamData,
+      GRID_SIZE,
+      GRID_SIZE,
+      THREE.RGBAFormat
+    );
+    shoreFoamTex.colorSpace = THREE.SRGBColorSpace;
+    shoreFoamTex.magFilter = THREE.LinearFilter;
+    shoreFoamTex.minFilter = THREE.LinearFilter;
+    shoreFoamTex.flipY = false;
+
+    const shoreFoamGeo = new THREE.PlaneGeometry(TERRAIN_SPAN, TERRAIN_SPAN);
+    shoreFoamGeo.rotateX(-Math.PI / 2);
+    shoreFoamGeo.translate(TERRAIN_CENTER, -0.015, TERRAIN_CENTER);
+    const shoreFoamMat = new THREE.MeshBasicMaterial({
+      map: shoreFoamTex,
+      transparent: true,
+      opacity: 0.72,
+      depthWrite: false,
+    });
+    const shoreFoamMesh = new THREE.Mesh(shoreFoamGeo, shoreFoamMat);
+    scene.add(shoreFoamMesh);
+
+    // --- 3. Shared Materials (3-Style PBR Buildings + Analytical White Mode) ---
+    const rciResMat = new THREE.MeshStandardMaterial({
+      map: assets.resAlbedo,
+      emissiveMap: assets.resEmissive,
+      bumpMap: assets.facadeBump,
+      bumpScale: 0.024,
       emissive: new THREE.Color('#ffffff'),
       emissiveIntensity: 0.0,
-      roughness: 0.36,
+      roughness: 0.56,
+      metalness: 0.12,
+      transparent: true,
+      opacity: 1,
+    });
+
+    const rciComMat = new THREE.MeshStandardMaterial({
+      map: assets.comAlbedo,
+      emissiveMap: assets.comEmissive,
+      bumpMap: assets.facadeBump,
+      bumpScale: 0.02,
+      emissive: new THREE.Color('#ffffff'),
+      emissiveIntensity: 0.0,
+      roughness: 0.18,
+      metalness: 0.56,
+      envMapIntensity: 1.35,
+      transparent: true,
+      opacity: 1,
+    });
+
+    const rciIndMat = new THREE.MeshStandardMaterial({
+      map: assets.indAlbedo,
+      emissiveMap: assets.indEmissive,
+      bumpMap: assets.facadeBump,
+      bumpScale: 0.028,
+      emissive: new THREE.Color('#ffffff'),
+      emissiveIntensity: 0.0,
+      roughness: 0.72,
       metalness: 0.28,
       transparent: true,
       opacity: 1,
     });
 
     const solidRealisticMat = new THREE.MeshStandardMaterial({
-      roughness: 0.55,
-      metalness: 0.18,
+      roughness: 0.54,
+      metalness: 0.16,
       transparent: true,
       opacity: 1,
     });
@@ -228,25 +398,28 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       opacity: 1,
     });
 
-    // Helper to create world-spanning InstancedMesh safely
+    const streetBulbMat = new THREE.MeshBasicMaterial({ color: '#fde68a' });
+
     const makeInstanced = (
       geo: THREE.BufferGeometry,
       mat: THREE.Material,
-      maxCount: number
+      maxCount: number,
+      opts?: { dynamic?: boolean; castShadow?: boolean; receiveShadow?: boolean }
     ): THREE.InstancedMesh => {
       geo.boundingSphere = WORLD_SPHERE;
       const im = new THREE.InstancedMesh(geo, mat, maxCount);
       im.count = 0;
       im.frustumCulled = false;
-      im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      // Initialize instanceColor buffer upfront
+      im.instanceMatrix.setUsage(opts?.dynamic ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
+      im.castShadow = Boolean(opts?.castShadow);
+      im.receiveShadow = Boolean(opts?.receiveShadow);
       im.setColorAt(0, new THREE.Color('#ffffff'));
       return im;
     };
 
-    // Static Instanced Pools
+    // Base geometries
     const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-    boxGeo.translate(0, 0.5, 0); // Pivot at ground base!
+    boxGeo.translate(0, 0.5, 0);
 
     const cylGeo = new THREE.CylinderGeometry(0.5, 0.5, 1, 12);
     cylGeo.translate(0, 0.5, 0);
@@ -254,79 +427,185 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
     const coneGeo = new THREE.ConeGeometry(0.55, 1, 8);
     coneGeo.translate(0, 0.5, 0);
 
-    const roadDeckMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 28000);
-    const roadStripeMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 24000);
-    const bridgePierMesh = makeInstanced(cylGeo.clone(), solidRealisticMat, 4000);
-    const zonePadMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, TOTAL_CELLS);
-    const rciTowerMesh = makeInstanced(boxGeo.clone(), bldgRealisticMat, TOTAL_CELLS * 2);
-    const rciRoofMesh = makeInstanced(coneGeo.clone(), solidRealisticMat, 6000);
-    const treeFoliageMesh = makeInstanced(coneGeo.clone(), solidRealisticMat, 8000);
-    const civicBoxMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 4000);
-    const civicCylMesh = makeInstanced(cylGeo.clone(), solidRealisticMat, 2000);
+    const broadGeo = new THREE.IcosahedronGeometry(0.54, 1);
+    broadGeo.translate(0, 0.5, 0);
+
+    const vehicleMergedGeo = createMergedBoxGeometry([
+      { sx: 0.16, sy: 0.075, sz: 0.30, px: 0, py: 0.0375, pz: 0 }, // Body chassis
+      { sx: 0.13, sy: 0.055, sz: 0.16, px: 0, py: 0.1025, pz: -0.02 }, // Glass cabin
+    ]);
+
+    // Static Instanced Pools
+    const roadSidewalkMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 28000, {
+      receiveShadow: true,
+    });
+    const roadDeckMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 28000, {
+      receiveShadow: true,
+    });
+    const roadStripeMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 32000);
+    const bridgePierMesh = makeInstanced(cylGeo.clone(), solidRealisticMat, 4500, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const streetLightPoleMesh = makeInstanced(cylGeo.clone(), solidRealisticMat, 6000, {
+      castShadow: true,
+    });
+    const streetLightBulbMesh = makeInstanced(boxGeo.clone(), streetBulbMat, 6000);
+
+    const zonePadMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, TOTAL_CELLS, {
+      receiveShadow: true,
+    });
+    const rciResMesh = makeInstanced(boxGeo.clone(), rciResMat, TOTAL_CELLS * 2, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const rciComMesh = makeInstanced(boxGeo.clone(), rciComMat, TOTAL_CELLS * 2, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const rciIndMesh = makeInstanced(boxGeo.clone(), rciIndMat, TOTAL_CELLS * 2, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const rciDetailMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, TOTAL_CELLS * 2, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const rciRoofMesh = makeInstanced(coneGeo.clone(), solidRealisticMat, 6000, {
+      castShadow: true,
+    });
+
+    const treeTrunkMesh = makeInstanced(cylGeo.clone(), solidRealisticMat, 8000, {
+      castShadow: true,
+    });
+    const treePineMesh = makeInstanced(coneGeo.clone(), solidRealisticMat, 8000, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const treeBroadMesh = makeInstanced(broadGeo.clone(), solidRealisticMat, 8000, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+
+    const civicBoxMesh = makeInstanced(boxGeo.clone(), solidRealisticMat, 4500, {
+      castShadow: true,
+      receiveShadow: true,
+    });
+    const civicCylMesh = makeInstanced(cylGeo.clone(), solidRealisticMat, 2200, {
+      castShadow: true,
+      receiveShadow: true,
+    });
 
     scene.add(
+      roadSidewalkMesh,
       roadDeckMesh,
       roadStripeMesh,
       bridgePierMesh,
+      streetLightPoleMesh,
+      streetLightBulbMesh,
       zonePadMesh,
-      rciTowerMesh,
+      rciResMesh,
+      rciComMesh,
+      rciIndMesh,
+      rciDetailMesh,
       rciRoofMesh,
-      treeFoliageMesh,
+      treeTrunkMesh,
+      treePineMesh,
+      treeBroadMesh,
       civicBoxMesh,
       civicCylMesh
     );
 
-    // Underground & Transit Layer Group
     const metroGroup = new THREE.Group();
     scene.add(metroGroup);
 
     const busLinesGroup = new THREE.Group();
     scene.add(busLinesGroup);
 
-    // Macro-Tile Borders Group (9 purchasable tiles)
     const tileBordersGroup = new THREE.Group();
     scene.add(tileBordersGroup);
 
+    // Reusable per-cell zone drag preview InstancedMesh (0 heap allocations during touchmove)
+    const zonePreviewMesh = makeInstanced(
+      boxGeo.clone(),
+      new THREE.MeshBasicMaterial({
+        color: '#ffffff',
+        transparent: true,
+        opacity: 0.62,
+        depthWrite: false,
+      }),
+      1600,
+      { dynamic: true }
+    );
+    scene.add(zonePreviewMesh);
+
     // Dynamic Instanced Pools (60 FPS animated)
     const vehicleMesh = makeInstanced(
-      boxGeo.clone(),
-      new THREE.MeshLambertMaterial({ color: '#ffffff' }),
-      420
+      vehicleMergedGeo,
+      new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.35, metalness: 0.25 }),
+      420,
+      { dynamic: true, castShadow: true }
     );
     const headlightMesh = makeInstanced(
       boxGeo.clone(),
       new THREE.MeshBasicMaterial({ color: '#fef08a' }),
-      420
+      420,
+      { dynamic: true }
+    );
+    const taillightMesh = makeInstanced(
+      boxGeo.clone(),
+      new THREE.MeshBasicMaterial({ color: '#ef4444' }),
+      420,
+      { dynamic: true }
+    );
+    const sirenBeaconMesh = makeInstanced(
+      boxGeo.clone(),
+      new THREE.MeshBasicMaterial({ color: '#ffffff' }),
+      120,
+      { dynamic: true }
     );
     const turbineBladeMesh = makeInstanced(
       boxGeo.clone(),
       new THREE.MeshStandardMaterial({ color: '#f8fafc', roughness: 0.3 }),
-      600
+      600,
+      { dynamic: true, castShadow: true }
     );
     const metroTrainMesh = makeInstanced(
       boxGeo.clone(),
       new THREE.MeshBasicMaterial({ color: '#22d3ee' }),
-      120
+      120,
+      { dynamic: true }
     );
     const fxParticleMesh = makeInstanced(
       boxGeo.clone(),
       new THREE.MeshBasicMaterial({ color: '#ffffff' }),
-      650
+      650,
+      { dynamic: true }
     );
 
-    scene.add(vehicleMesh, headlightMesh, turbineBladeMesh, metroTrainMesh, fxParticleMesh);
+    scene.add(
+      vehicleMesh,
+      headlightMesh,
+      taillightMesh,
+      sirenBeaconMesh,
+      turbineBladeMesh,
+      metroTrainMesh,
+      fxParticleMesh
+    );
 
-    // Animated Airplane Group (visible once International Airport monument is built)
+    // Animated Commercial Airplane
     const airplaneGroup = new THREE.Group();
     const fuselage = new THREE.Mesh(
       new THREE.CylinderGeometry(0.18, 0.14, 1.9, 10),
       new THREE.MeshStandardMaterial({ color: '#f8fafc', roughness: 0.25 })
     );
     fuselage.rotation.z = Math.PI / 2;
+    fuselage.castShadow = true;
     const wings = new THREE.Mesh(
       new THREE.BoxGeometry(0.35, 0.05, 1.95),
       new THREE.MeshStandardMaterial({ color: '#38bdf8', roughness: 0.3 })
     );
+    wings.castShadow = true;
     const tailFin = new THREE.Mesh(
       new THREE.BoxGeometry(0.32, 0.42, 0.06),
       new THREE.MeshStandardMaterial({ color: '#0284c7' })
@@ -336,7 +615,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
     airplaneGroup.visible = false;
     scene.add(airplaneGroup);
 
-    // Interactive Preview & Coverage Ring Group
     const previewGroup = new THREE.Group();
     scene.add(previewGroup);
 
@@ -346,29 +624,56 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         color: '#38bdf8',
         side: THREE.DoubleSide,
         transparent: true,
-        opacity: 0.75,
+        opacity: 0.78,
       })
     );
     coverageRing.rotation.x = -Math.PI / 2;
     coverageRing.visible = false;
     scene.add(coverageRing);
 
-    // Wind turbines locations cache + Airport position cache for fast RAF animation
     let windTurbineCoords: { x: number; y: number; z: number }[] = [];
     let airportCoords: { x: number; y: number; z: number } | null = null;
     let roadCellsList: number[] = [];
 
-    // Store realistic vs analytical colors per static instance so toggling Info Views takes 0.05ms
-    let rciRealColors: Uint32Array = new Uint32Array(TOTAL_CELLS * 2);
-    let rciCellIndices: Int32Array = new Int32Array(TOTAL_CELLS * 2);
-    let roadDeckCellIndices: Int32Array = new Int32Array(28000);
-    let roadDeckRealColors: Uint32Array = new Uint32Array(28000);
-    let civicStructIds: Int32Array = new Int32Array(4000);
-    let civicRealColors: Uint32Array = new Uint32Array(4000);
+    // Analytical view state arrays shared cleanly across RCI meshes
+    const rciPoolEntries = [
+      {
+        mesh: rciResMesh,
+        mat: rciResMat as THREE.Material,
+        cellIndices: new Int32Array(TOTAL_CELLS * 2),
+        realColors: new Uint32Array(TOTAL_CELLS * 2),
+        slot: 0,
+      },
+      {
+        mesh: rciComMesh,
+        mat: rciComMat as THREE.Material,
+        cellIndices: new Int32Array(TOTAL_CELLS * 2),
+        realColors: new Uint32Array(TOTAL_CELLS * 2),
+        slot: 0,
+      },
+      {
+        mesh: rciIndMesh,
+        mat: rciIndMat as THREE.Material,
+        cellIndices: new Int32Array(TOTAL_CELLS * 2),
+        realColors: new Uint32Array(TOTAL_CELLS * 2),
+        slot: 0,
+      },
+      {
+        mesh: rciDetailMesh,
+        mat: solidRealisticMat as THREE.Material,
+        cellIndices: new Int32Array(TOTAL_CELLS * 2),
+        realColors: new Uint32Array(TOTAL_CELLS * 2),
+        slot: 0,
+      },
+    ];
+
+    const roadDeckCellIndices = new Int32Array(28000);
+    const roadDeckRealColors = new Uint32Array(28000);
+    const civicRealColors = new Uint32Array(4500);
 
     const vehicles: VehicleAgent[] = [];
 
-    // --- 4. Rebuild Terrain Geometry & Static City Meshes ---
+    // --- 4. Terrain Geometry & Static City Mesh Builder ---
     let syncedCityId = '';
     let lastMeshVer = -1;
     let lastOverlayVer = -1;
@@ -391,38 +696,93 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           const h = eng.elevation[i];
           posAttr.setY(i, h);
 
+          // Slope gradient for natural cliff rock shading
+          const hx1 = x + 1 < GRID_SIZE ? eng.elevation[i + 1] : h;
+          const hx0 = x > 0 ? eng.elevation[i - 1] : h;
+          const hz1 = z + 1 < GRID_SIZE ? eng.elevation[i + GRID_SIZE] : h;
+          const hz0 = z > 0 ? eng.elevation[i - GRID_SIZE] : h;
+          const slope = Math.max(Math.abs(hx1 - hx0), Math.abs(hz1 - hz0)) * 0.5;
+
           const tk = eng.terrain[i] as TerrainKind;
           const unlocked = eng.isTileUnlockedAt(x, z);
+
+          // Coastal shallow turquoise & animated shoreline foam data
+          const foamOff = i * 4;
+          if (isWaterTerrain(tk)) {
+            let nearLand = false;
+            for (const [dx, dz] of [
+              [1, 0],
+              [-1, 0],
+              [0, 1],
+              [0, -1],
+            ]) {
+              const nx = x + dx;
+              const nz = z + dz;
+              if (eng.inBounds(nx, nz) && !isWaterTerrain(eng.terrain[eng.idx(nx, nz)])) {
+                nearLand = true;
+                break;
+              }
+            }
+            if (nearLand || h > -0.28) {
+              shoreFoamData[foamOff] = nearLand ? 224 : 103;
+              shoreFoamData[foamOff + 1] = nearLand ? 247 : 232;
+              shoreFoamData[foamOff + 2] = 250;
+              shoreFoamData[foamOff + 3] = nearLand ? 165 : 70;
+            } else {
+              shoreFoamData[foamOff] = 0;
+              shoreFoamData[foamOff + 1] = 0;
+              shoreFoamData[foamOff + 2] = 0;
+              shoreFoamData[foamOff + 3] = 0;
+            }
+          } else {
+            shoreFoamData[foamOff] = 0;
+            shoreFoamData[foamOff + 1] = 0;
+            shoreFoamData[foamOff + 2] = 0;
+            shoreFoamData[foamOff + 3] = 0;
+          }
+
           if (tk === TerrainKind.DeepWater) {
-            _color.setHex(0x075985);
+            _color.setHex(0x064e78);
           } else if (tk === TerrainKind.ShallowWater) {
             _color.setHex(0x0ea5e9);
           } else if (tk === TerrainKind.Beach) {
-            _color.setHex(0xe7d3a8);
+            _color.setHex(h < 0.2 ? 0xd4bd92 : 0xe9d8b4);
           } else if (tk === TerrainKind.Fertile) {
-            _color.setHex(0x3f8f4e);
+            _color.setHex(0x3a8f4d);
           } else if (tk === TerrainKind.Hill) {
-            _color.setHex(0x527955);
+            _color.setHex(0x4e7953);
           } else if (tk === TerrainKind.Mountain) {
-            _color.setHex(h > 8.6 ? 0xe2e8f0 : 0x64748b);
+            _color.setHex(h > 8.4 ? 0xf1f5f9 : 0x64748b);
           } else {
-            _color.setHex(0x4d9457);
+            _color.setHex(0x4c9658);
+          }
+
+          // Organic grass richness variation & cliff rock blending
+          if (!isWaterTerrain(tk) && tk !== TerrainKind.Beach) {
+            const patch = (((x * 37 + z * 53) % 11) - 5) * 0.008;
+            _color.offsetHSL(patch * 0.25, 0.02, patch);
+            if (slope > 0.52 && tk !== TerrainKind.Mountain) {
+              const rockBlend = Math.min(0.82, (slope - 0.52) * 1.15);
+              _color.lerp(new THREE.Color('#64748b'), rockBlend);
+            }
           }
 
           if (!unlocked) {
-            _color.lerp(new THREE.Color('#1e293b'), 0.36);
+            _color.lerp(new THREE.Color('#0f172a'), 0.42);
           }
           colAttr.setXYZ(i, _color.r, _color.g, _color.b);
         }
       }
       posAttr.needsUpdate = true;
       colAttr.needsUpdate = true;
+      shoreFoamTex.needsUpdate = true;
       terrainGeo.computeVertexNormals();
     };
 
     const rebuildTileBorders = (eng: CityEngine) => {
       while (tileBordersGroup.children.length > 0) {
         const ch = tileBordersGroup.children.pop()!;
+        if ((ch as THREE.Line).geometry) (ch as THREE.Line).geometry.dispose();
         tileBordersGroup.remove(ch);
       }
 
@@ -433,7 +793,7 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           const x0 = tx * MACRO_TILE_SIZE - 0.5;
           const z0 = tz * MACRO_TILE_SIZE - 0.5;
           const s = MACRO_TILE_SIZE;
-          const y = 1.8;
+          const y = 1.85;
 
           const pts = [
             new THREE.Vector3(x0, y, z0),
@@ -446,29 +806,61 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           const lineMat = new THREE.LineBasicMaterial({
             color: unlocked ? '#38bdf8' : '#f59e0b',
             transparent: true,
-            opacity: showTilesRef.current ? 0.92 : unlocked ? 0.25 : 0.42,
+            opacity: showTilesRef.current ? 0.92 : unlocked ? 0.24 : 0.42,
           });
           tileBordersGroup.add(new THREE.Line(lineGeo, lineMat));
         }
       }
     };
 
+    const pushRciBox = (
+      poolIdx: number,
+      cellIdx: number,
+      px: number,
+      py: number,
+      pz: number,
+      rotY: number,
+      sx: number,
+      sy: number,
+      sz: number,
+      hex: number
+    ) => {
+      const p = rciPoolEntries[poolIdx];
+      if (p.slot >= TOTAL_CELLS * 2 - 2) return;
+      _dummy.position.set(px, py, pz);
+      _dummy.rotation.set(0, rotY, 0);
+      _dummy.scale.set(sx, sy, sz);
+      _dummy.updateMatrix();
+      p.mesh.setMatrixAt(p.slot, _dummy.matrix);
+      _color.setHex(hex);
+      p.mesh.setColorAt(p.slot, _color);
+      p.cellIndices[p.slot] = cellIdx;
+      p.realColors[p.slot] = hex;
+      p.slot++;
+    };
+
     const rebuildStaticCityMeshes = (eng: CityEngine) => {
+      let sidewalkSlot = 0;
       let deckSlot = 0;
       let stripeSlot = 0;
       let pierSlot = 0;
+      let lightPoleSlot = 0;
+      let lightBulbSlot = 0;
       let zoneSlot = 0;
-      let rciSlot = 0;
       let roofSlot = 0;
-      let treeSlot = 0;
+      let trunkSlot = 0;
+      let pineSlot = 0;
+      let broadSlot = 0;
       let civicBoxSlot = 0;
       let civicCylSlot = 0;
+
+      for (const p of rciPoolEntries) p.slot = 0;
 
       windTurbineCoords = [];
       airportCoords = null;
       roadCellsList = [];
 
-      // 1. Roads, Intersections, Diagonals & Automatic Bridges over Water
+      // 1. Roads, Sidewalk Curbs, Crosswalks, Bridges & Night Streetlights
       for (let z = 0; z < GRID_SIZE; z++) {
         for (let x = 0; x < GRID_SIZE; x++) {
           const i = eng.idx(x, z);
@@ -480,20 +872,33 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
             const baseY = isBridge ? 1.55 : surfaceHeightAt(eng, x, z) + 0.04;
             const width =
               tier === RoadTier.Highway6L ? 0.86 : tier === RoadTier.Avenue4L ? 0.72 : 0.54;
+            const curbWidth = width + 0.18;
             const asphaltHex =
               tier === RoadTier.Highway6L
-                ? 0x1e293b
+                ? 0x162030
                 : tier === RoadTier.Avenue4L
-                ? 0x273449
-                : 0x334155;
+                ? 0x1e293b
+                : 0x283548;
 
-            // Central road hub pad
+            // Curb / Sidewalk hub pad (non-highway) or raised bridge deck
+            if (tier !== RoadTier.Highway6L && !isBridge && sidewalkSlot < 27900) {
+              _dummy.position.set(x, baseY - 0.02, z);
+              _dummy.rotation.set(0, 0, 0);
+              _dummy.scale.set(curbWidth, 0.075, curbWidth);
+              _dummy.updateMatrix();
+              roadSidewalkMesh.setMatrixAt(sidewalkSlot, _dummy.matrix);
+              _color.setHex(0xcbd5e1);
+              roadSidewalkMesh.setColorAt(sidewalkSlot, _color);
+              sidewalkSlot++;
+            }
+
+            // Central asphalt hub pad
             _dummy.position.set(x, baseY, z);
             _dummy.rotation.set(0, 0, 0);
             _dummy.scale.set(width, isBridge ? 0.22 : 0.09, width);
             _dummy.updateMatrix();
             roadDeckMesh.setMatrixAt(deckSlot, _dummy.matrix);
-            _color.setHex(isBridge ? 0x475569 : asphaltHex);
+            _color.setHex(isBridge ? 0x3f4c5e : asphaltHex);
             roadDeckMesh.setColorAt(deckSlot, _color);
             roadDeckCellIndices[deckSlot] = i;
             roadDeckRealColors[deckSlot] = _color.getHex();
@@ -520,31 +925,44 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
                   ? (baseY + (neighborBridge ? 1.55 : surfaceHeightAt(eng, nx, nz) + 0.04)) * 0.5
                   : (baseY + surfaceHeightAt(eng, nx, nz) + 0.04) * 0.5;
 
-              _dummy.position.set(mx, armY, mz);
-              _dummy.rotation.set(0, angle, 0);
-              _dummy.scale.set(width, isBridge ? 0.2 : 0.09, armLen);
-              _dummy.updateMatrix();
-              roadDeckMesh.setMatrixAt(deckSlot, _dummy.matrix);
-              _color.setHex(isBridge ? 0x475569 : asphaltHex);
-              roadDeckMesh.setColorAt(deckSlot, _color);
-              roadDeckCellIndices[deckSlot] = i;
-              roadDeckRealColors[deckSlot] = _color.getHex();
-              deckSlot++;
+              if (tier !== RoadTier.Highway6L && !isBridge && sidewalkSlot < 27900) {
+                _dummy.position.set(mx, armY - 0.02, mz);
+                _dummy.rotation.set(0, angle, 0);
+                _dummy.scale.set(curbWidth, 0.075, armLen);
+                _dummy.updateMatrix();
+                roadSidewalkMesh.setMatrixAt(sidewalkSlot, _dummy.matrix);
+                _color.setHex(0xcbd5e1);
+                roadSidewalkMesh.setColorAt(sidewalkSlot, _color);
+                sidewalkSlot++;
+              }
 
-              // Center lane divider / landscaped median
-              if (stripeSlot < 23900) {
+              if (deckSlot < 27900) {
+                _dummy.position.set(mx, armY, mz);
+                _dummy.rotation.set(0, angle, 0);
+                _dummy.scale.set(width, isBridge ? 0.2 : 0.09, armLen);
+                _dummy.updateMatrix();
+                roadDeckMesh.setMatrixAt(deckSlot, _dummy.matrix);
+                _color.setHex(isBridge ? 0x3f4c5e : asphaltHex);
+                roadDeckMesh.setColorAt(deckSlot, _color);
+                roadDeckCellIndices[deckSlot] = i;
+                roadDeckRealColors[deckSlot] = _color.getHex();
+                deckSlot++;
+              }
+
+              // Lane divider / Avenue landscaped median
+              if (stripeSlot < 31900) {
                 _dummy.position.set(mx, armY + (isBridge ? 0.21 : 0.095), mz);
                 _dummy.rotation.set(0, angle, 0);
                 _dummy.scale.set(
-                  tier === RoadTier.Avenue4L ? 0.1 : 0.045,
+                  tier === RoadTier.Avenue4L ? 0.11 : 0.045,
                   0.025,
-                  armLen * 0.72
+                  armLen * 0.68
                 );
                 _dummy.updateMatrix();
                 roadStripeMesh.setMatrixAt(stripeSlot, _dummy.matrix);
                 _color.setHex(
                   tier === RoadTier.Avenue4L
-                    ? 0x22c55e
+                    ? 0x16a34a
                     : tier === RoadTier.Highway6L
                     ? 0xfacc15
                     : 0xe2e8f0
@@ -552,173 +970,326 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
                 roadStripeMesh.setColorAt(stripeSlot, _color);
                 stripeSlot++;
               }
+
+              // Bridge side safety parapets over water
+              if (isBridge && sidewalkSlot < 27900) {
+                const px = Math.cos(angle) * (width * 0.52);
+                const pz = -Math.sin(angle) * (width * 0.52);
+                for (const side of [-1, 1]) {
+                  if (sidewalkSlot >= 27900) break;
+                  _dummy.position.set(mx + px * side, armY + 0.18, mz + pz * side);
+                  _dummy.rotation.set(0, angle, 0);
+                  _dummy.scale.set(0.06, 0.16, armLen);
+                  _dummy.updateMatrix();
+                  roadSidewalkMesh.setMatrixAt(sidewalkSlot, _dummy.matrix);
+                  _color.setHex(0xe2e8f0);
+                  roadSidewalkMesh.setColorAt(sidewalkSlot, _color);
+                  sidewalkSlot++;
+                }
+              }
             }
 
-            // Intersection crosswalk + traffic signal post on 3+ way junctions
-            if (degCount >= 3 && stripeSlot < 23900) {
-              _dummy.position.set(x, baseY + 0.1, z);
+            // Zebra crosswalk stripes at intersections (degCount >= 3)
+            if (degCount >= 3 && stripeSlot < 31880) {
+              const zebraY = baseY + (isBridge ? 0.21 : 0.096);
+              for (let sOff = -0.18; sOff <= 0.181; sOff += 0.12) {
+                _dummy.position.set(x + sOff, zebraY, z);
+                _dummy.rotation.set(0, 0, 0);
+                _dummy.scale.set(0.05, 0.015, width * 0.72);
+                _dummy.updateMatrix();
+                roadStripeMesh.setMatrixAt(stripeSlot, _dummy.matrix);
+                _color.setHex(0xf8fafc);
+                roadStripeMesh.setColorAt(stripeSlot, _color);
+                stripeSlot++;
+              }
+            }
+
+            // Avenue 4L boulevard median mini-trees + Night Streetlights
+            if (tier === RoadTier.Avenue4L && !isBridge && (x + z) % 2 === 0 && broadSlot < 7950) {
+              _dummy.position.set(x, baseY + 0.11, z);
               _dummy.rotation.set(0, 0, 0);
-              _dummy.scale.set(width * 0.85, 0.02, width * 0.85);
+              _dummy.scale.set(0.22, 0.28, 0.22);
               _dummy.updateMatrix();
-              roadStripeMesh.setMatrixAt(stripeSlot, _dummy.matrix);
-              _color.setHex(0x64748b);
-              roadStripeMesh.setColorAt(stripeSlot, _color);
-              stripeSlot++;
+              treeBroadMesh.setMatrixAt(broadSlot, _dummy.matrix);
+              _color.setHex(0x22c55e);
+              treeBroadMesh.setColorAt(broadSlot, _color);
+              broadSlot++;
             }
 
-            // Automatic concrete bridge piers & suspension pylons over water
-            if (isBridge && pierSlot < 3950 && (x + z) % 2 === 0) {
+            if (
+              tier !== RoadTier.Highway6L &&
+              (x + z) % 3 === 0 &&
+              lightPoleSlot < 5950 &&
+              lightBulbSlot < 5950
+            ) {
+              const side = (x + z) % 2 === 0 ? 1 : -1;
+              const lx = x + side * (width * 0.56);
+              const lz = z + side * (width * 0.18);
+              const ly = baseY + (isBridge ? 0.18 : 0.06);
+              _dummy.position.set(lx, ly, lz);
+              _dummy.rotation.set(0, 0, 0);
+              _dummy.scale.set(0.04, 0.52, 0.04);
+              _dummy.updateMatrix();
+              streetLightPoleMesh.setMatrixAt(lightPoleSlot, _dummy.matrix);
+              _color.setHex(0x475569);
+              streetLightPoleMesh.setColorAt(lightPoleSlot, _color);
+              lightPoleSlot++;
+
+              _dummy.position.set(lx, ly + 0.5, lz);
+              _dummy.scale.set(0.11, 0.07, 0.11);
+              _dummy.updateMatrix();
+              streetLightBulbMesh.setMatrixAt(lightBulbSlot++, _dummy.matrix);
+            }
+
+            // Bridge piers & twin cable-stayed pylons over water
+            if (isBridge && pierSlot < 4450 && (x + z) % 2 === 0) {
               const bedY = Math.min(-0.6, eng.elevation[i]);
               const pierH = 1.55 - bedY;
               _dummy.position.set(x, bedY, z);
               _dummy.rotation.set(0, 0, 0);
-              _dummy.scale.set(0.24, pierH, 0.24);
+              _dummy.scale.set(0.26, pierH, 0.26);
               _dummy.updateMatrix();
               bridgePierMesh.setMatrixAt(pierSlot, _dummy.matrix);
               _color.setHex(0x94a3b8);
               bridgePierMesh.setColorAt(pierSlot, _color);
               pierSlot++;
 
-              if (tier >= RoadTier.Avenue4L && (x + z) % 6 === 0 && pierSlot < 3950) {
+              if (tier >= RoadTier.Avenue4L && (x + z) % 6 === 0 && pierSlot < 4450) {
                 _dummy.position.set(x, 1.55, z);
-                _dummy.scale.set(0.16, 2.2, 0.85);
+                _dummy.scale.set(0.16, 2.35, 0.92);
                 _dummy.updateMatrix();
                 bridgePierMesh.setMatrixAt(pierSlot, _dummy.matrix);
-                _color.setHex(0xe2e8f0);
+                _color.setHex(0xf1f5f9);
                 bridgePierMesh.setColorAt(pierSlot, _color);
                 pierSlot++;
               }
             }
           }
 
-          // 2. Zoned Parcels & Organic RCI Buildings (Levels 1..5)
+          // 2. Zoned Parcels & Oriented Multi-Volume RCI Architecture (Levels 1..5)
           const zKind = eng.zones[i] as ZoneKind;
           if (zKind !== ZoneKind.None) {
             const groundY = surfaceHeightAt(eng, x, z);
             const lv = eng.rciLevel[i];
             const diagMode = eng.rciDiag[i];
-            const rotY =
-              diagMode === 1
-                ? Math.PI / 4
-                : diagMode === 2
-                ? -Math.PI / 4
-                : ((eng.rciVariant[i] & 3) * Math.PI) / 2;
-            const lotScale = diagMode !== 0 ? 0.66 : 0.84;
+            const rotY = eng.getRoadFacingAngle(x, z);
+            const lotScale = diagMode !== 0 ? 0.68 : 0.86;
 
-            // Subtle zone lot pad
             _dummy.position.set(x, groundY + 0.015, z);
             _dummy.rotation.set(0, rotY, 0);
             _dummy.scale.set(lotScale, 0.04, lotScale);
             _dummy.updateMatrix();
             zonePadMesh.setMatrixAt(zoneSlot, _dummy.matrix);
             _color.set(ZONE_CATALOG[zKind].color);
-            if (lv > 0) _color.lerp(new THREE.Color('#94a3b8'), 0.65);
+            if (lv > 0) _color.lerp(new THREE.Color('#64748b'), 0.7);
             zonePadMesh.setColorAt(zoneSlot, _color);
             zoneSlot++;
 
-            if (lv > 0 && rciSlot < TOTAL_CELLS * 2 - 4) {
+            if (lv > 0) {
               const abandoned = eng.rciAbandoned[i] === 1;
               const variant = eng.rciVariant[i];
+              const isRes = zKind === ZoneKind.ResLow || zKind === ZoneKind.ResHigh;
+              const isComOrOffice =
+                zKind === ZoneKind.ComLow || zKind === ZoneKind.ComHigh || zKind === ZoneKind.Office;
+              const poolIdx = isRes ? 0 : isComOrOffice ? 1 : 2;
 
-              // Calculate realistic height & architectural silhouette by zone & level (1..5)
-              let h = 0.7;
+              let h = 0.72;
               let w = lotScale * 0.82;
               let d = lotScale * 0.82;
               let tint = 0xffffff;
 
               if (zKind === ZoneKind.ResLow) {
-                h = 0.48 + lv * 0.22;
+                h = 0.46 + lv * 0.22;
                 w = lotScale * 0.66;
                 d = lotScale * 0.62;
-                tint = [0xfef3c7, 0xfde68a, 0xe2e8f0, 0xfecdd3][variant % 4];
+                tint = [0xfef3c7, 0xfde68a, 0xf1f5f9, 0xfecdd3][variant % 4];
               } else if (zKind === ZoneKind.ResHigh) {
-                h = 1.6 + lv * 1.15 + (variant % 3) * 0.35;
-                tint = [0xe2e8f0, 0xcbd5e1, 0xbae6fd, 0xfef9c3][variant % 4];
+                h = 1.65 + lv * 1.18 + (variant % 3) * 0.35;
+                tint = [0xe2e8f0, 0xfef3c7, 0xbae6fd, 0xdbeafe][variant % 4];
               } else if (zKind === ZoneKind.ComLow) {
                 h = 0.65 + lv * 0.28;
                 tint = [0xbae6fd, 0xfde68a, 0xddd6fe, 0xfed7aa][variant % 4];
               } else if (zKind === ZoneKind.ComHigh) {
-                h = 2.0 + lv * 1.45 + (variant % 3) * 0.4;
+                h = 2.05 + lv * 1.48 + (variant % 3) * 0.4;
                 tint = [0x93c5fd, 0xa5f3fc, 0xc7d2fe, 0xe2e8f0][variant % 4];
               } else if (zKind === ZoneKind.Industrial) {
-                h = 0.65 + lv * 0.26;
+                h = 0.68 + lv * 0.28;
                 w = lotScale * 0.88;
                 tint = [0xd6d3d1, 0xfde047, 0xfdba74, 0xa8a29e][variant % 4];
               } else {
-                // Clean Tech Office skyscrapers
-                h = 2.2 + lv * 1.55 + (variant % 2) * 0.5;
+                h = 2.3 + lv * 1.58 + (variant % 2) * 0.5;
                 tint = [0x67e8f9, 0x93c5fd, 0xe0f2fe, 0xc4b5fd][variant % 4];
               }
 
               if (abandoned) tint = 0x475569;
               if (eng.cellFire[i] > 0) tint = 0xf97316;
 
-              // Main building volume
-              _dummy.position.set(x, groundY + 0.04, z);
-              _dummy.rotation.set(0, rotY, 0);
-              _dummy.scale.set(w, h, d);
-              _dummy.updateMatrix();
-              rciTowerMesh.setMatrixAt(rciSlot, _dummy.matrix);
-              _color.setHex(tint);
-              rciTowerMesh.setColorAt(rciSlot, _color);
-              rciRealColors[rciSlot] = tint;
-              rciCellIndices[rciSlot] = i;
-              rciSlot++;
+              const sinR = Math.sin(rotY);
+              const cosR = Math.cos(rotY);
 
-              // Upper setback tower crown for Level 4-5 skyscrapers
-              if (
-                lv >= 4 &&
-                (zKind === ZoneKind.ResHigh ||
-                  zKind === ZoneKind.ComHigh ||
-                  zKind === ZoneKind.Office) &&
-                rciSlot < TOTAL_CELLS * 2 - 2
-              ) {
-                const crownH = h * 0.36;
-                _dummy.position.set(x, groundY + 0.04 + h, z);
-                _dummy.rotation.set(0, rotY, 0);
-                _dummy.scale.set(w * 0.64, crownH, d * 0.64);
-                _dummy.updateMatrix();
-                rciTowerMesh.setMatrixAt(rciSlot, _dummy.matrix);
-                _color.setHex(tint);
-                rciTowerMesh.setColorAt(rciSlot, _color);
-                rciRealColors[rciSlot] = tint;
-                rciCellIndices[rciSlot] = i;
-                rciSlot++;
-              }
+              // Main tower / volume
+              pushRciBox(poolIdx, i, x, groundY + 0.04, z, rotY, w, h, d, tint);
 
-              // Pitched roof on low-density houses
-              if (zKind === ZoneKind.ResLow && roofSlot < 5950) {
-                _dummy.position.set(x, groundY + 0.04 + h, z);
-                _dummy.rotation.set(0, rotY + Math.PI / 4, 0);
-                _dummy.scale.set(w * 1.15, 0.36, d * 1.15);
-                _dummy.updateMatrix();
-                rciRoofMesh.setMatrixAt(roofSlot, _dummy.matrix);
-                _color.setHex(
-                  abandoned ? 0x334155 : [0xb45309, 0x991b1b, 0x334155, 0x0f766e][variant % 4]
+              // Ground podium / porch / storefront awning oriented toward street (+Z local)
+              if (zKind === ZoneKind.ResLow) {
+                // Front porch step facing road
+                pushRciBox(
+                  3,
+                  i,
+                  x + sinR * (d * 0.52),
+                  groundY + 0.04,
+                  z + cosR * (d * 0.52),
+                  rotY,
+                  w * 0.52,
+                  0.14,
+                  0.18,
+                  abandoned ? 0x334155 : 0xf8fafc
                 );
-                rciRoofMesh.setColorAt(roofSlot, _color);
-                roofSlot++;
+                // Pitched roof
+                if (roofSlot < 5950) {
+                  _dummy.position.set(x, groundY + 0.04 + h, z);
+                  _dummy.rotation.set(0, rotY + Math.PI / 4, 0);
+                  _dummy.scale.set(w * 1.16, 0.36, d * 1.16);
+                  _dummy.updateMatrix();
+                  rciRoofMesh.setMatrixAt(roofSlot, _dummy.matrix);
+                  _color.setHex(
+                    abandoned ? 0x334155 : [0xb45309, 0x991b1b, 0x334155, 0x0f766e][variant % 4]
+                  );
+                  rciRoofMesh.setColorAt(roofSlot, _color);
+                  roofSlot++;
+                }
+              } else if (zKind === ZoneKind.ComLow) {
+                // Street-facing storefront awning
+                pushRciBox(
+                  3,
+                  i,
+                  x + sinR * (d * 0.53),
+                  groundY + 0.32,
+                  z + cosR * (d * 0.53),
+                  rotY,
+                  w * 0.88,
+                  0.09,
+                  0.18,
+                  abandoned ? 0x475569 : [0x0ea5e9, 0xf97316, 0x10b981, 0x8b5cf6][variant % 4]
+                );
+              } else if (zKind === ZoneKind.Industrial) {
+                // Industrial chimney stack
+                pushRciBox(
+                  3,
+                  i,
+                  x - w * 0.25,
+                  groundY + 0.04 + h,
+                  z - d * 0.25,
+                  rotY,
+                  0.14,
+                  0.45 + lv * 0.08,
+                  0.14,
+                  0x57534e
+                );
+              } else {
+                // High-rise ground lobby podium
+                pushRciBox(
+                  3,
+                  i,
+                  x,
+                  groundY + 0.04,
+                  z,
+                  rotY,
+                  lotScale * 0.94,
+                  0.38,
+                  lotScale * 0.94,
+                  abandoned ? 0x334155 : 0x475569
+                );
+                // Upper setback crown for Lv 3..5 skyscrapers
+                if (lv >= 3) {
+                  const crownH = h * (lv >= 4 ? 0.36 : 0.22);
+                  pushRciBox(
+                    poolIdx,
+                    i,
+                    x,
+                    groundY + 0.04 + h,
+                    z,
+                    rotY,
+                    w * 0.64,
+                    crownH,
+                    d * 0.64,
+                    tint
+                  );
+                  // Rooftop mechanical / helipad / spire on Lv 4-5
+                  if (lv >= 4) {
+                    pushRciBox(
+                      3,
+                      i,
+                      x,
+                      groundY + 0.04 + h + crownH,
+                      z,
+                      rotY,
+                      w * 0.32,
+                      0.16,
+                      d * 0.32,
+                      0x94a3b8
+                    );
+                    if (lv === 5 && (zKind === ZoneKind.ComHigh || zKind === ZoneKind.Office)) {
+                      pushRciBox(
+                        3,
+                        i,
+                        x,
+                        groundY + 0.2 + h + crownH,
+                        z,
+                        rotY,
+                        0.06,
+                        0.95,
+                        0.06,
+                        0xf8fafc
+                      );
+                    }
+                  }
+                }
               }
             }
           }
 
-          // 3. Natural Forest Trees
-          if (eng.trees[i] > 0 && treeSlot < 7950) {
+          // 3. Natural Forest Trees (Wood Trunk + Conifer/Broadleaf Canopy)
+          if (eng.trees[i] > 0 && trunkSlot < 7950) {
             const groundY = surfaceHeightAt(eng, x, z);
-            const s = 0.45 + eng.trees[i] * 0.16;
+            const s = 0.46 + eng.trees[i] * 0.15;
+            const tk = eng.terrain[i] as TerrainKind;
+
+            // Wood trunk
             _dummy.position.set(x, groundY, z);
-            _dummy.rotation.set(0, (i * 1.3) % Math.PI, 0);
-            _dummy.scale.set(s, s * 1.85, s);
+            _dummy.rotation.set(0, 0, 0);
+            _dummy.scale.set(0.11 * s, 0.42 * s, 0.11 * s);
             _dummy.updateMatrix();
-            treeFoliageMesh.setMatrixAt(treeSlot, _dummy.matrix);
-            _color.setHex(eng.trees[i] === 3 ? 0x15803d : 0x16a34a);
-            treeFoliageMesh.setColorAt(treeSlot, _color);
-            treeSlot++;
+            treeTrunkMesh.setMatrixAt(trunkSlot, _dummy.matrix);
+            _color.setHex(0x78350f);
+            treeTrunkMesh.setColorAt(trunkSlot, _color);
+            trunkSlot++;
+
+            const isConifer = tk === TerrainKind.Hill || ((x * 13 + z * 7) % 3 === 0);
+            if (isConifer && pineSlot < 7950) {
+              _dummy.position.set(x, groundY + 0.28 * s, z);
+              _dummy.rotation.set(0, (i * 1.3) % Math.PI, 0);
+              _dummy.scale.set(s * 0.95, s * 1.65, s * 0.95);
+              _dummy.updateMatrix();
+              treePineMesh.setMatrixAt(pineSlot, _dummy.matrix);
+              _color.setHex(eng.trees[i] === 3 ? 0x15803d : 0x166534);
+              treePineMesh.setColorAt(pineSlot, _color);
+              pineSlot++;
+            } else if (broadSlot < 7950) {
+              _dummy.position.set(x, groundY + 0.34 * s, z);
+              _dummy.rotation.set(0, (i * 0.9) % Math.PI, 0);
+              _dummy.scale.set(s * 0.88, s * 0.88, s * 0.88);
+              _dummy.updateMatrix();
+              treeBroadMesh.setMatrixAt(broadSlot, _dummy.matrix);
+              _color.setHex(eng.trees[i] === 3 ? 0x16a34a : 0x22c55e);
+              treeBroadMesh.setColorAt(broadSlot, _color);
+              broadSlot++;
+            }
           }
         }
       }
 
-      // 4. Civic Structures, Power/Water Plants, Parks, Transit & Unique Monuments
+      // 4. Civic Structures, Power/Water Plants, Parks, Transit & Monuments
       for (const st of eng.structures) {
         const spec = BUILDING_SPECS[st.buildingId];
         const cx = st.x + st.w * 0.5 - 0.5;
@@ -734,7 +1305,7 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           sz: number,
           hex: number
         ) => {
-          if (civicBoxSlot >= 3980) return;
+          if (civicBoxSlot >= 4480) return;
           _dummy.position.set(px, py, pz);
           _dummy.rotation.set(0, (st.rotation * Math.PI) / 2, 0);
           _dummy.scale.set(sx, sy, sz);
@@ -742,7 +1313,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           civicBoxMesh.setMatrixAt(civicBoxSlot, _dummy.matrix);
           _color.setHex(hex);
           civicBoxMesh.setColorAt(civicBoxSlot, _color);
-          civicStructIds[civicBoxSlot] = st.id;
           civicRealColors[civicBoxSlot] = hex;
           civicBoxSlot++;
         };
@@ -756,7 +1326,7 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           rz: number,
           hex: number
         ) => {
-          if (civicCylSlot >= 1980) return;
+          if (civicCylSlot >= 2180) return;
           _dummy.position.set(px, py, pz);
           _dummy.rotation.set(0, 0, 0);
           _dummy.scale.set(rx, sy, rz);
@@ -768,68 +1338,77 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         };
 
         if (st.buildingId === 'wind_turbine') {
-          pushCyl(cx, gy, cz, 0.22, 3.2, 0.22, 0xf8fafc);
+          pushCyl(cx, gy, cz, 0.24, 0.25, 0.24, 0x94a3b8);
+          pushCyl(cx, gy + 0.2, cz, 0.16, 3.05, 0.16, 0xf8fafc);
           windTurbineCoords.push({ x: cx, y: gy + 3.15, z: cz });
         } else if (st.buildingId === 'water_tower') {
-          pushCyl(cx, gy, cz, 0.28, 1.8, 0.28, 0x94a3b8);
-          pushCyl(cx, gy + 1.75, cz, 0.78, 0.75, 0.78, 0x38bdf8);
+          pushCyl(cx, gy, cz, 0.3, 1.8, 0.3, 0x64748b);
+          pushCyl(cx, gy + 1.75, cz, 0.82, 0.78, 0.82, 0x38bdf8);
+          pushCyl(cx, gy + 2.53, cz, 0.45, 0.16, 0.45, 0x0284c7);
         } else if (st.buildingId === 'coal_plant') {
-          pushBox(cx, gy, cz, 1.75, 1.2, 1.75, 0x78716c);
-          pushCyl(cx - 0.45, gy + 1.2, cz - 0.4, 0.32, 2.2, 0.32, 0xd6d3d1);
-          pushCyl(cx + 0.45, gy + 1.2, cz - 0.4, 0.32, 2.0, 0.32, 0xd6d3d1);
+          pushBox(cx, gy, cz, 1.78, 1.25, 1.78, 0x78716c);
+          pushCyl(cx - 0.45, gy + 1.25, cz - 0.4, 0.3, 2.35, 0.3, 0xd6d3d1);
+          pushCyl(cx + 0.45, gy + 1.25, cz - 0.4, 0.3, 2.15, 0.3, 0xd6d3d1);
         } else if (st.buildingId === 'nuclear_plant') {
-          pushBox(cx, gy, cz, 2.6, 1.3, 2.6, 0xcbd5e1);
-          pushCyl(cx - 0.65, gy + 1.1, cz - 0.5, 0.95, 2.8, 0.95, 0xe2e8f0);
-          pushCyl(cx + 0.65, gy + 1.1, cz + 0.5, 0.95, 2.8, 0.95, 0xe2e8f0);
+          pushBox(cx, gy, cz, 2.65, 1.25, 2.65, 0xcbd5e1);
+          pushCyl(cx - 0.65, gy + 1.1, cz - 0.5, 0.96, 2.95, 0.96, 0xe2e8f0);
+          pushCyl(cx + 0.65, gy + 1.1, cz + 0.5, 0.96, 2.95, 0.96, 0xe2e8f0);
         } else if (st.buildingId === 'solar_plant') {
           pushBox(cx, gy, cz, 1.85, 0.16, 1.85, 0x94a3b8);
-          pushBox(cx, gy + 0.16, cz - 0.4, 1.65, 0.22, 0.6, 0x1d4ed8);
-          pushBox(cx, gy + 0.16, cz + 0.4, 1.65, 0.22, 0.6, 0x1d4ed8);
+          pushBox(cx, gy + 0.16, cz - 0.42, 1.68, 0.24, 0.62, 0x1d4ed8);
+          pushBox(cx, gy + 0.16, cz + 0.42, 1.68, 0.24, 0.62, 0x1d4ed8);
         } else if (st.buildingId === 'city_park' || st.buildingId === 'botanical_plaza') {
-          pushBox(cx, gy, cz, st.w - 0.12, 0.1, st.d - 0.12, 0x16a34a);
-          pushCyl(cx, gy + 0.1, cz, 0.65, 0.18, 0.65, 0x38bdf8);
-          if (treeSlot < 7950) {
-            _dummy.position.set(cx - 0.6, gy + 0.1, cz - 0.6);
-            _dummy.scale.set(0.55, 1.1, 0.55);
-            _dummy.updateMatrix();
-            treeFoliageMesh.setMatrixAt(treeSlot, _dummy.matrix);
-            _color.setHex(0x22c55e);
-            treeFoliageMesh.setColorAt(treeSlot, _color);
-            treeSlot++;
+          pushBox(cx, gy, cz, st.w - 0.1, 0.1, st.d - 0.1, 0x16a34a);
+          pushCyl(cx, gy + 0.1, cz, 0.68, 0.2, 0.68, 0x38bdf8);
+          for (const [ox, oz] of [
+            [-0.6, -0.6],
+            [0.6, 0.6],
+          ]) {
+            if (trunkSlot < 7950 && broadSlot < 7950) {
+              _dummy.position.set(cx + ox, gy + 0.1, cz + oz);
+              _dummy.scale.set(0.09, 0.32, 0.09);
+              _dummy.updateMatrix();
+              treeTrunkMesh.setMatrixAt(trunkSlot, _dummy.matrix);
+              _color.setHex(0x78350f);
+              treeTrunkMesh.setColorAt(trunkSlot++, _color);
+
+              _dummy.position.set(cx + ox, gy + 0.34, cz + oz);
+              _dummy.scale.set(0.65, 0.72, 0.65);
+              _dummy.updateMatrix();
+              treeBroadMesh.setMatrixAt(broadSlot, _dummy.matrix);
+              _color.setHex(0x22c55e);
+              treeBroadMesh.setColorAt(broadSlot++, _color);
+            }
           }
         } else if (st.buildingId === 'monument_stadium') {
-          // Grand Oval Stadium with green pitch
-          pushCyl(cx, gy, cz, 3.7, 1.55, 3.4, 0xe2e8f0);
-          pushCyl(cx, gy + 0.2, cz, 2.4, 1.4, 2.1, 0x16a34a);
-          pushBox(cx - 1.5, gy + 1.55, cz - 1.5, 0.2, 1.1, 0.2, 0xfef08a);
-          pushBox(cx + 1.5, gy + 1.55, cz + 1.5, 0.2, 1.1, 0.2, 0xfef08a);
+          pushCyl(cx, gy, cz, 3.75, 1.55, 3.45, 0xe2e8f0);
+          pushCyl(cx, gy + 0.22, cz, 2.45, 1.4, 2.15, 0x16a34a);
+          pushBox(cx - 1.55, gy + 1.55, cz - 1.55, 0.22, 1.25, 0.22, 0xfef08a);
+          pushBox(cx + 1.55, gy + 1.55, cz + 1.55, 0.22, 1.25, 0.22, 0xfef08a);
+          pushBox(cx - 1.55, gy + 1.55, cz + 1.55, 0.22, 1.25, 0.22, 0xfef08a);
+          pushBox(cx + 1.55, gy + 1.55, cz - 1.55, 0.22, 1.25, 0.22, 0xfef08a);
         } else if (st.buildingId === 'monument_fox_tower') {
-          // Panoramic Needle Spire
-          pushCyl(cx, gy, cz, 2.1, 0.7, 2.1, 0x334155);
-          pushCyl(cx, gy + 0.7, cz, 0.55, 7.6, 0.55, 0xe2e8f0);
-          pushCyl(cx, gy + 6.4, cz, 1.45, 0.65, 1.45, 0x38bdf8);
-          pushCyl(cx, gy + 8.3, cz, 0.12, 2.2, 0.12, 0xef4444);
+          pushCyl(cx, gy, cz, 2.15, 0.72, 2.15, 0x334155);
+          pushCyl(cx, gy + 0.72, cz, 0.56, 7.65, 0.56, 0xe2e8f0);
+          pushCyl(cx, gy + 6.45, cz, 1.5, 0.68, 1.5, 0x38bdf8);
+          pushCyl(cx, gy + 8.37, cz, 0.12, 2.25, 0.12, 0xef4444);
         } else if (st.buildingId === 'monument_airport') {
-          // International Terminal + Control Tower + Active Runway
           pushBox(cx, gy, cz - 0.9, st.w - 0.3, 0.95, 1.4, 0x93c5fd);
-          pushCyl(cx - 1.6, gy + 0.95, cz - 0.9, 0.38, 2.1, 0.38, 0xf8fafc);
-          // Asphalt runway strip
-          pushBox(cx, gy, cz + 0.95, st.w - 0.1, 0.12, 1.35, 0x1e293b);
-          airportCoords = { x: cx, y: gy + 0.35, z: cz + 0.95 };
+          pushCyl(cx - 1.6, gy + 0.95, cz - 0.9, 0.38, 2.15, 0.38, 0xf8fafc);
+          pushBox(cx, gy, cz + 0.95, st.w - 0.1, 0.12, 1.38, 0x1e293b);
+          airportCoords = { x: cx, y: gy + 0.36, z: cz + 0.95 };
         } else if (st.buildingId === 'monument_arcology') {
-          // Futuristic terraced pyramid mega-spire
-          pushBox(cx, gy, cz, 3.6, 1.8, 3.6, 0x0f766e);
-          pushBox(cx, gy + 1.8, cz, 2.6, 3.2, 2.6, 0x0ea5e9);
-          pushBox(cx, gy + 5.0, cz, 1.6, 4.2, 1.6, 0xa855f7);
-          pushCyl(cx, gy + 9.2, cz, 0.25, 2.6, 0.25, 0xfef08a);
+          pushBox(cx, gy, cz, 3.65, 1.85, 3.65, 0x0f766e);
+          pushBox(cx, gy + 1.85, cz, 2.65, 3.25, 2.65, 0x0ea5e9);
+          pushBox(cx, gy + 5.1, cz, 1.65, 4.25, 1.65, 0xa855f7);
+          pushCyl(cx, gy + 9.35, cz, 0.26, 2.7, 0.26, 0xfef08a);
         } else {
-          // Clinics, Hospitals, Schools, Universities, Police, Fire, Bus Depot, Metro Station
           const baseH =
             st.buildingId === 'hospital' || st.buildingId === 'university'
-              ? 2.2
+              ? 2.25
               : st.buildingId === 'metro_station'
-              ? 0.68
-              : 1.25;
+              ? 0.72
+              : 1.28;
           pushBox(
             cx,
             gy,
@@ -840,27 +1419,43 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
             new THREE.Color(spec.colorHex).getHex()
           );
           pushBox(cx, gy + baseH, cz, (st.w - 0.18) * 0.65, 0.28, (st.d - 0.18) * 0.65, 0xf8fafc);
+          if (st.buildingId === 'hospital') {
+            pushCyl(cx, gy + baseH + 0.28, cz, 0.65, 0.08, 0.65, 0xef4444);
+          }
         }
       }
 
+      roadSidewalkMesh.count = sidewalkSlot;
       roadDeckMesh.count = deckSlot;
       roadStripeMesh.count = stripeSlot;
       bridgePierMesh.count = pierSlot;
+      streetLightPoleMesh.count = lightPoleSlot;
+      streetLightBulbMesh.count = lightBulbSlot;
       zonePadMesh.count = zoneSlot;
-      rciTowerMesh.count = rciSlot;
+      for (const p of rciPoolEntries) p.mesh.count = p.slot;
       rciRoofMesh.count = roofSlot;
-      treeFoliageMesh.count = treeSlot;
+      treeTrunkMesh.count = trunkSlot;
+      treePineMesh.count = pineSlot;
+      treeBroadMesh.count = broadSlot;
       civicBoxMesh.count = civicBoxSlot;
       civicCylMesh.count = civicCylSlot;
 
       for (const m of [
+        roadSidewalkMesh,
         roadDeckMesh,
         roadStripeMesh,
         bridgePierMesh,
+        streetLightPoleMesh,
+        streetLightBulbMesh,
         zonePadMesh,
-        rciTowerMesh,
+        rciResMesh,
+        rciComMesh,
+        rciIndMesh,
+        rciDetailMesh,
         rciRoofMesh,
-        treeFoliageMesh,
+        treeTrunkMesh,
+        treePineMesh,
+        treeBroadMesh,
         civicBoxMesh,
         civicCylMesh,
       ]) {
@@ -868,14 +1463,17 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         if (m.instanceColor) m.instanceColor.needsUpdate = true;
       }
 
-      // 5. Rebuild Bus Stop Markers & Colored Line Ribbons
+      // 5. Rebuild Bus Stop Markers & Line Ribbons
       while (busLinesGroup.children.length > 0) {
-        busLinesGroup.remove(busLinesGroup.children[0]);
+        const ch = busLinesGroup.children.pop()!;
+        if ((ch as THREE.Mesh).geometry) (ch as THREE.Mesh).geometry.dispose();
       }
       for (const line of eng.busLines) {
         const pts: THREE.Vector3[] = [];
         for (const st of line.stops) {
-          const y = (isWaterTerrain(eng.terrain[eng.idx(st.x, st.z)]) ? 1.8 : surfaceHeightAt(eng, st.x, st.z)) + 0.28;
+          const y =
+            (isWaterTerrain(eng.terrain[eng.idx(st.x, st.z)]) ? 1.8 : surfaceHeightAt(eng, st.x, st.z)) +
+            0.28;
           pts.push(new THREE.Vector3(st.x, y, st.z));
           const stopPole = new THREE.Mesh(
             new THREE.CylinderGeometry(0.16, 0.16, 0.55, 10),
@@ -904,7 +1502,8 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
       // 6. Rebuild Underground Metro Platforms & Glowing Tubes (Y = -2.1)
       while (metroGroup.children.length > 0) {
-        metroGroup.remove(metroGroup.children[0]);
+        const ch = metroGroup.children.pop()!;
+        if ((ch as THREE.Mesh).geometry) (ch as THREE.Mesh).geometry.dispose();
       }
       for (const st of eng.structures) {
         if (st.buildingId !== 'metro_station') continue;
@@ -922,7 +1521,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         shaft.position.set(cx, (surfaceHeightAt(eng, st.x, st.z) - 2.1) * 0.5, cz);
         metroGroup.add(platform, shaft);
       }
-
       for (const seg of eng.metroSegments) {
         const curve = new THREE.LineCurve3(
           new THREE.Vector3(seg.fromX, -2.1, seg.fromZ),
@@ -949,22 +1547,32 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       terrainNormalMat.opacity = isMetroXray ? 0.24 : 1.0;
       terrainNormalMat.depthWrite = !isMetroXray;
       waterMat.opacity = isMetroXray ? 0.18 : isWhiteInfo ? 0.35 : 0.86;
+      shoreFoamMesh.visible = !isWhiteInfo && !isMetroXray;
 
-      rciTowerMesh.material = isWhiteInfo ? whiteInfoMat : bldgRealisticMat;
-      bldgRealisticMat.opacity = isMetroXray ? 0.22 : 1.0;
+      for (const p of rciPoolEntries) {
+        p.mesh.material = isWhiteInfo ? whiteInfoMat : p.mat;
+      }
+      rciResMat.opacity = isMetroXray ? 0.22 : 1.0;
+      rciComMat.opacity = isMetroXray ? 0.22 : 1.0;
+      rciIndMat.opacity = isMetroXray ? 0.22 : 1.0;
       solidRealisticMat.opacity = isMetroXray ? 0.3 : 1.0;
-      treeFoliageMesh.visible = !isWhiteInfo && !isMetroXray;
+
+      treeTrunkMesh.visible = !isWhiteInfo && !isMetroXray;
+      treePineMesh.visible = !isWhiteInfo && !isMetroXray;
+      treeBroadMesh.visible = !isWhiteInfo && !isMetroXray;
       rciRoofMesh.visible = !isWhiteInfo && !isMetroXray;
+      streetLightPoleMesh.visible = !isWhiteInfo && !isMetroXray;
       metroGroup.visible = isMetroXray || eng.metroSegments.length > 0;
 
       if (!isWhiteInfo) {
-        // Restore realistic colors if coming back from white view
         if (lastOverlayMode !== 'normal' && lastOverlayMode !== 'metro') {
-          for (let s = 0; s < rciTowerMesh.count; s++) {
-            _color.setHex(rciRealColors[s]);
-            rciTowerMesh.setColorAt(s, _color);
+          for (const p of rciPoolEntries) {
+            for (let s = 0; s < p.mesh.count; s++) {
+              _color.setHex(p.realColors[s]);
+              p.mesh.setColorAt(s, _color);
+            }
+            if (p.mesh.instanceColor) p.mesh.instanceColor.needsUpdate = true;
           }
-          if (rciTowerMesh.instanceColor) rciTowerMesh.instanceColor.needsUpdate = true;
 
           for (let s = 0; s < roadDeckMesh.count; s++) {
             _color.setHex(roadDeckRealColors[s]);
@@ -1032,28 +1640,29 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       }
       overlayDataTex.needsUpdate = true;
 
-      // Color RCI buildings analytically
-      for (let s = 0; s < rciTowerMesh.count; s++) {
-        const ci = rciCellIndices[s];
-        if (mode === 'power') {
-          _color.setHex(eng.powerMap[ci] ? 0x0ea5e9 : 0xef4444);
-        } else if (mode === 'water') {
-          _color.setHex(eng.waterMap[ci] ? 0x06b6d4 : 0xf97316);
-        } else if (mode === 'traffic') {
-          _color.setHex(0xf1f5f9);
-        } else if (mode === 'land_value') {
-          _color.setHSL(0.36, 0.8, 0.78 - (eng.landValueMap[ci] / 100) * 0.42);
-        } else if (mode === 'pollution') {
-          const p = eng.pollutionMap[ci] / 100;
-          _color.setRGB(0.95 - p * 0.15, 0.95 - p * 0.65, 0.96 - p * 0.25);
-        } else {
-          _color.setHSL(0.58, 0.85, 0.82 - (eng.serviceMap[ci] / 100) * 0.45);
+      // Color all RCI meshes uniformly in analytical mode
+      for (const p of rciPoolEntries) {
+        for (let s = 0; s < p.mesh.count; s++) {
+          const ci = p.cellIndices[s];
+          if (mode === 'power') {
+            _color.setHex(eng.powerMap[ci] ? 0x0ea5e9 : 0xef4444);
+          } else if (mode === 'water') {
+            _color.setHex(eng.waterMap[ci] ? 0x06b6d4 : 0xf97316);
+          } else if (mode === 'traffic') {
+            _color.setHex(0xf1f5f9);
+          } else if (mode === 'land_value') {
+            _color.setHSL(0.36, 0.8, 0.78 - (eng.landValueMap[ci] / 100) * 0.42);
+          } else if (mode === 'pollution') {
+            const poll = eng.pollutionMap[ci] / 100;
+            _color.setRGB(0.95 - poll * 0.15, 0.95 - poll * 0.65, 0.96 - poll * 0.25);
+          } else {
+            _color.setHSL(0.58, 0.85, 0.82 - (eng.serviceMap[ci] / 100) * 0.45);
+          }
+          p.mesh.setColorAt(s, _color);
         }
-        rciTowerMesh.setColorAt(s, _color);
+        if (p.mesh.instanceColor) p.mesh.instanceColor.needsUpdate = true;
       }
-      if (rciTowerMesh.instanceColor) rciTowerMesh.instanceColor.needsUpdate = true;
 
-      // Color Roads (Traffic green->amber->red heatmap in Traffic view)
       for (let s = 0; s < roadDeckMesh.count; s++) {
         const ci = roadDeckCellIndices[s];
         if (mode === 'traffic') {
@@ -1067,41 +1676,55 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       if (roadDeckMesh.instanceColor) roadDeckMesh.instanceColor.needsUpdate = true;
     };
 
-    // --- 6. Live Ghost Preview Builder ---
+    // --- 6. Live Ghost & Per-Cell Road-Access Zone Preview ---
+    const clearPreviewGroup = () => {
+      while (previewGroup.children.length > 0) {
+        const ch = previewGroup.children.pop()!;
+        if ((ch as THREE.Mesh).geometry) (ch as THREE.Mesh).geometry.dispose();
+        if ((ch as THREE.Mesh).material) {
+          const mat = (ch as THREE.Mesh).material;
+          if (!Array.isArray(mat)) mat.dispose();
+        }
+      }
+    };
+
     const updatePreviewVisuals = (
       startCell: { x: number; z: number } | null,
-      hoverCell: { x: number; z: number } | null
+      hoverHit: { x: number; z: number; hitX: number; hitZ: number } | null
     ) => {
-      while (previewGroup.children.length > 0) {
-        previewGroup.remove(previewGroup.children[0]);
-      }
+      clearPreviewGroup();
       coverageRing.visible = false;
+      zonePreviewMesh.count = 0;
 
       const eng = engineRef.current;
       const curTool = toolRef.current;
 
-      // Show pending mobile structure placement if active
       const activeStructPlacement =
         pendingRef.current ||
-        (curTool.kind === 'building' && hoverCell
-          ? {
-              buildingId: curTool.buildingId,
-              x: hoverCell.x,
-              z: hoverCell.z,
-              rotation: rotRef.current,
-              ...eng.canPlaceStructure(
+        (curTool.kind === 'building' && hoverHit
+          ? (() => {
+              const centered = getCenteredFootprintOrigin(
+                hoverHit.hitX,
+                hoverHit.hitZ,
                 curTool.buildingId,
-                hoverCell.x,
-                hoverCell.z,
                 rotRef.current
-              ),
-              valid: eng.canPlaceStructure(
+              );
+              const check = eng.canPlaceStructure(
                 curTool.buildingId,
-                hoverCell.x,
-                hoverCell.z,
+                centered.x,
+                centered.z,
                 rotRef.current
-              ).ok,
-            }
+              );
+              return {
+                buildingId: curTool.buildingId,
+                x: centered.x,
+                z: centered.z,
+                rotation: rotRef.current,
+                cost: check.cost,
+                valid: check.ok,
+                reason: check.reason,
+              };
+            })()
           : null);
 
       if (activeStructPlacement) {
@@ -1110,8 +1733,8 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         const d = activeStructPlacement.rotation % 2 === 1 ? spec.w : spec.d;
         const cx = activeStructPlacement.x + w * 0.5 - 0.5;
         const cz = activeStructPlacement.z + d * 0.5 - 0.5;
-        const gy = eng.inBounds(activeStructPlacement.x, activeStructPlacement.z)
-          ? surfaceHeightAt(eng, activeStructPlacement.x, activeStructPlacement.z)
+        const gy = eng.inBounds(Math.round(cx), Math.round(cz))
+          ? surfaceHeightAt(eng, Math.round(cx), Math.round(cz))
           : 1;
 
         const ghost = new THREE.Mesh(
@@ -1133,48 +1756,75 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         return;
       }
 
-      if (!hoverCell) return;
+      if (!hoverHit) return;
 
       if (curTool.kind === 'road') {
         const pts = startCell
-          ? eng.computeSmartRoadPath(startCell.x, startCell.z, hoverCell.x, hoverCell.z)
-          : [hoverCell];
+          ? eng.computeSmartRoadPath(startCell.x, startCell.z, hoverHit.x, hoverHit.z)
+          : [hoverHit];
         const est = eng.estimateRoadPathCost(pts, curTool.tier);
         const col = est.valid ? '#38bdf8' : '#ef4444';
         for (const p of pts) {
           const isW = isWaterTerrain(eng.terrain[eng.idx(p.x, p.z)]);
           const y = isW ? 1.65 : surfaceHeightAt(eng, p.x, p.z) + 0.16;
           const m = new THREE.Mesh(
-            new THREE.BoxGeometry(0.75, 0.18, 0.75),
-            new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.7 })
+            new THREE.BoxGeometry(0.76, 0.18, 0.76),
+            new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.72 })
           );
           m.position.set(p.x, y, p.z);
           previewGroup.add(m);
         }
-      } else if (curTool.kind === 'zone' || curTool.kind === 'bulldoze') {
-        const a = startCell || hoverCell;
-        const minX = Math.min(a.x, hoverCell.x);
-        const maxX = Math.max(a.x, hoverCell.x);
-        const minZ = Math.min(a.z, hoverCell.z);
-        const maxZ = Math.max(a.z, hoverCell.z);
-        const w = maxX - minX + 1;
-        const d = maxZ - minZ + 1;
-        const col =
-          curTool.kind === 'bulldoze' ? '#ef4444' : ZONE_CATALOG[curTool.zone].color;
-        const box = new THREE.Mesh(
-          new THREE.BoxGeometry(w, 0.25, d),
-          new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.45 })
-        );
-        box.position.set(
-          minX + w * 0.5 - 0.5,
-          surfaceHeightAt(eng, hoverCell.x, hoverCell.z) + 0.18,
-          minZ + d * 0.5 - 0.5
-        );
-        previewGroup.add(box);
+      } else if (curTool.kind === 'zone') {
+        const a = startCell || hoverHit;
+        const evalRes = eng.evaluateZoneRect(a.x, a.z, hoverHit.x, hoverHit.z, curTool.zone);
+        const validHex = new THREE.Color(ZONE_CATALOG[curTool.zone].color).getHex();
+        let slot = 0;
+        for (const c of evalRes.cells) {
+          if (slot >= 1599) break;
+          const cy = isWaterTerrain(eng.terrain[eng.idx(c.x, c.z)])
+            ? 0.06
+            : surfaceHeightAt(eng, c.x, c.z) + 0.08;
+          _dummy.position.set(c.x, cy, c.z);
+          _dummy.rotation.set(0, 0, 0);
+          _dummy.scale.set(0.92, 0.16, 0.92);
+          _dummy.updateMatrix();
+          zonePreviewMesh.setMatrixAt(slot, _dummy.matrix);
+          _color.setHex(c.valid ? validHex : 0xef4444);
+          zonePreviewMesh.setColorAt(slot, _color);
+          slot++;
+        }
+        zonePreviewMesh.count = slot;
+        zonePreviewMesh.instanceMatrix.needsUpdate = true;
+        if (zonePreviewMesh.instanceColor) zonePreviewMesh.instanceColor.needsUpdate = true;
+      } else if (curTool.kind === 'bulldoze') {
+        const a = startCell || hoverHit;
+        const minX = Math.min(a.x, hoverHit.x);
+        const maxX = Math.max(a.x, hoverHit.x);
+        const minZ = Math.min(a.z, hoverHit.z);
+        const maxZ = Math.max(a.z, hoverHit.z);
+        let slot = 0;
+        for (let zz = minZ; zz <= maxZ && slot < 1599; zz++) {
+          for (let xx = minX; xx <= maxX && slot < 1599; xx++) {
+            const cy = isWaterTerrain(eng.terrain[eng.idx(xx, zz)])
+              ? 0.15
+              : surfaceHeightAt(eng, xx, zz) + 0.08;
+            _dummy.position.set(xx, cy, zz);
+            _dummy.rotation.set(0, 0, 0);
+            _dummy.scale.set(0.94, 0.22, 0.94);
+            _dummy.updateMatrix();
+            zonePreviewMesh.setMatrixAt(slot, _dummy.matrix);
+            _color.setHex(0xef4444);
+            zonePreviewMesh.setColorAt(slot, _color);
+            slot++;
+          }
+        }
+        zonePreviewMesh.count = slot;
+        zonePreviewMesh.instanceMatrix.needsUpdate = true;
+        if (zonePreviewMesh.instanceColor) zonePreviewMesh.instanceColor.needsUpdate = true;
       } else if (curTool.kind === 'metro_tunnel' && startCell) {
         const lineGeo = new THREE.BufferGeometry().setFromPoints([
           new THREE.Vector3(startCell.x, -1.9, startCell.z),
-          new THREE.Vector3(hoverCell.x, -1.9, hoverCell.z),
+          new THREE.Vector3(hoverHit.x, -1.9, hoverHit.z),
         ]);
         previewGroup.add(
           new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: '#22d3ee' }))
@@ -1182,31 +1832,127 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       }
     };
 
-    // --- 7. Unified Desktop Mouse/Keyboard + Mobile Touch Gesture State Machine ---
+    // --- 7. Exact 1:1 Analytic Heightfield Raycast (Zero Touch Offset, Zero Parallax) ---
     const raycaster = new THREE.Raycaster();
-    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1.1);
+    const ndcVec = new THREE.Vector2();
+    const fallbackPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1.0);
+    const slabHit = new THREE.Vector3();
 
-    const screenToCell = (
+    const sampleSurfaceY = (
+      eng: CityEngine,
+      wx: number,
+      wz: number,
+      considerBridges: boolean
+    ): number => {
+      const cx = THREE.MathUtils.clamp(wx, 0, GRID_SIZE - 1);
+      const cz = THREE.MathUtils.clamp(wz, 0, GRID_SIZE - 1);
+      const ix = Math.floor(cx);
+      const iz = Math.floor(cz);
+      const nx = Math.min(GRID_SIZE - 1, ix + 1);
+      const nz = Math.min(GRID_SIZE - 1, iz + 1);
+      const fx = cx - ix;
+      const fz = cz - iz;
+
+      const rx = Math.round(cx);
+      const rz = Math.round(cz);
+      const ci = eng.idx(rx, rz);
+      if (considerBridges && eng.roadTier[ci] !== RoadTier.None && isWaterTerrain(eng.terrain[ci])) {
+        return 1.62;
+      }
+
+      const h00 = isWaterTerrain(eng.terrain[eng.idx(ix, iz)]) ? 0 : Math.max(0.05, eng.elevation[eng.idx(ix, iz)]);
+      const h10 = isWaterTerrain(eng.terrain[eng.idx(nx, iz)]) ? 0 : Math.max(0.05, eng.elevation[eng.idx(nx, iz)]);
+      const h01 = isWaterTerrain(eng.terrain[eng.idx(ix, nz)]) ? 0 : Math.max(0.05, eng.elevation[eng.idx(ix, nz)]);
+      const h11 = isWaterTerrain(eng.terrain[eng.idx(nx, nz)]) ? 0 : Math.max(0.05, eng.elevation[eng.idx(nx, nz)]);
+
+      const h0 = h00 + (h10 - h00) * fx;
+      const h1 = h01 + (h11 - h01) * fx;
+      return h0 + (h1 - h0) * fz;
+    };
+
+    const raycastTerrainPoint = (
       clientX: number,
-      clientY: number,
-      applyTouchOffset: boolean
-    ): { x: number; z: number } | null => {
+      clientY: number
+    ): { x: number; z: number; hitX: number; hitZ: number } | null => {
+      const eng = engineRef.current;
+      const curTool = toolRef.current;
+      const considerBridges =
+        curTool.kind === 'bulldoze' || curTool.kind === 'inspect' || curTool.kind === 'bus_line';
+
+      camera.updateMatrixWorld();
       const rect = renderer.domElement.getBoundingClientRect();
-      const adjY = applyTouchOffset ? clientY - 42 : clientY;
-      const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
-      const ndcY = -((adjY - rect.top) / rect.height) * 2 + 1;
-      raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-      const hit = new THREE.Vector3();
-      if (!raycaster.ray.intersectPlane(groundPlane, hit)) return null;
-      const gx = Math.round(hit.x);
-      const gz = Math.round(hit.z);
+      ndcVec.set(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -((clientY - rect.top) / rect.height) * 2 + 1
+      );
+      raycaster.setFromCamera(ndcVec, camera);
+
+      const ray = raycaster.ray;
+      if (Math.abs(ray.direction.y) < 1e-4) return null;
+
+      // Clip ray against vertical height slab Y in [-0.5, 14.5]
+      const tTop = (14.5 - ray.origin.y) / ray.direction.y;
+      const tBot = (-0.5 - ray.origin.y) / ray.direction.y;
+      const tMin = Math.max(0.5, Math.min(tTop, tBot));
+      const tMax = Math.max(tMin + 0.5, Math.max(tTop, tBot));
+
+      const STEPS = 32;
+      const dt = (tMax - tMin) / STEPS;
+      let prevT = tMin;
+      let hitFound = false;
+      let lo = tMin;
+      let hi = tMax;
+
+      for (let s = 0; s <= STEPS; s++) {
+        const t = tMin + s * dt;
+        const px = ray.origin.x + ray.direction.x * t;
+        const py = ray.origin.y + ray.direction.y * t;
+        const pz = ray.origin.z + ray.direction.z * t;
+
+        if (px >= -0.5 && px <= GRID_SIZE - 0.5 && pz >= -0.5 && pz <= GRID_SIZE - 0.5) {
+          const surfY = sampleSurfaceY(eng, px, pz, considerBridges);
+          if (py <= surfY) {
+            lo = prevT;
+            hi = t;
+            hitFound = true;
+            break;
+          }
+        }
+        prevT = t;
+      }
+
+      let hitX: number;
+      let hitZ: number;
+      if (hitFound) {
+        for (let b = 0; b < 6; b++) {
+          const mid = (lo + hi) * 0.5;
+          const mx = ray.origin.x + ray.direction.x * mid;
+          const my = ray.origin.y + ray.direction.y * mid;
+          const mz = ray.origin.z + ray.direction.z * mid;
+          if (my <= sampleSurfaceY(eng, mx, mz, considerBridges)) {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+        const finalT = (lo + hi) * 0.5;
+        hitX = ray.origin.x + ray.direction.x * finalT;
+        hitZ = ray.origin.z + ray.direction.z * finalT;
+      } else {
+        if (!ray.intersectPlane(fallbackPlane, slabHit)) return null;
+        hitX = slabHit.x;
+        hitZ = slabHit.z;
+      }
+
+      const gx = Math.round(hitX);
+      const gz = Math.round(hitZ);
       if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return null;
-      return { x: gx, z: gz };
+      return { x: gx, z: gz, hitX, hitZ };
     };
 
     const activePointers = new Map<number, { x: number; y: number; type: string }>();
     let dragStartCell: { x: number; z: number } | null = null;
-    let lastHoverCell: { x: number; z: number } | null = null;
+    let lastHoverHit: { x: number; z: number; hitX: number; hitZ: number } | null = null;
     let isRightOrbiting = false;
     let isPanning1Finger = false;
     let prevPinchDist = 0;
@@ -1228,7 +1974,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       renderer.domElement.setPointerCapture(e.pointerId);
       activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
 
-      // 2+ fingers immediately preempts any drawing tool and switches to pinch-zoom / twist-orbit
       if (activePointers.size >= 2) {
         abortedByMultiTouch = true;
         dragStartCell = null;
@@ -1246,7 +1991,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
       abortedByMultiTouch = false;
 
-      // Desktop right/middle button -> Orbit or Pan
       if (e.button === 2 || e.button === 1) {
         isRightOrbiting = e.button === 2 && !e.shiftKey;
         isPanning1Finger = e.button === 1 || (e.button === 2 && e.shiftKey);
@@ -1256,48 +2000,49 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       const isTouch = e.pointerType === 'touch';
       const curTool = toolRef.current;
 
-      // Neutral Camera Pan or Inspect
       if (curTool.kind === 'pan') {
         isPanning1Finger = true;
         return;
       }
 
-      const cell = screenToCell(
-        e.clientX,
-        e.clientY,
-        isTouch && curTool.kind !== 'inspect'
-      );
-      if (!cell) {
+      // Exact 1:1 terrain raycast at actual contact coordinates (0px touch offset)
+      const hit = raycastTerrainPoint(e.clientX, e.clientY);
+      if (!hit) {
         isPanning1Finger = true;
         return;
       }
 
       if (curTool.kind === 'inspect') {
-        onSelectInspect(engineRef.current.inspectCell(cell.x, cell.z));
+        onSelectInspect(engineRef.current.inspectCell(hit.x, hit.z));
         isPanning1Finger = true;
         return;
       }
 
       if (curTool.kind === 'bus_line') {
-        const res = engineRef.current.addBusStopTap(cell.x, cell.z);
+        const res = engineRef.current.addBusStopTap(hit.x, hit.z);
         onToast(res.message, res.ok ? 'ok' : 'warn');
         onAfterMutate();
         return;
       }
 
       if (curTool.kind === 'building') {
+        const centered = getCenteredFootprintOrigin(
+          hit.hitX,
+          hit.hitZ,
+          curTool.buildingId,
+          rotRef.current
+        );
         if (isTouch) {
-          // Mobile: position ghost preview + show Floating Confirmation Pill!
           const check = engineRef.current.canPlaceStructure(
             curTool.buildingId,
-            cell.x,
-            cell.z,
+            centered.x,
+            centered.z,
             rotRef.current
           );
           const nextPending: PendingMobilePlacement = {
             buildingId: curTool.buildingId,
-            x: cell.x,
-            z: cell.z,
+            x: centered.x,
+            z: centered.z,
             rotation: rotRef.current,
             cost: check.cost,
             valid: check.ok,
@@ -1305,14 +2050,13 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           };
           pendingRef.current = nextPending;
           setPendingPlacement(nextPending);
-          setTouchReticle({ x: e.clientX, y: e.clientY - 42 });
-          updatePreviewVisuals(null, cell);
+          setTouchReticle({ x: e.clientX, y: e.clientY });
+          updatePreviewVisuals(null, hit);
         } else {
-          // Desktop: direct click placement
           const placed = engineRef.current.placeStructure(
             curTool.buildingId,
-            cell.x,
-            cell.z,
+            centered.x,
+            centered.z,
             rotRef.current
           );
           if (!placed.ok && placed.reason) onToast(placed.reason, 'warn');
@@ -1321,13 +2065,12 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         return;
       }
 
-      // Drag tools: Road, Zone, Bulldoze, Metro Tunnel
-      dragStartCell = cell;
-      lastHoverCell = cell;
+      dragStartCell = { x: hit.x, z: hit.z };
+      lastHoverHit = hit;
       if (isTouch) {
-        setTouchReticle({ x: e.clientX, y: e.clientY - 42 });
+        setTouchReticle({ x: e.clientX, y: e.clientY });
       }
-      updatePreviewVisuals(cell, cell);
+      updatePreviewVisuals(dragStartCell, hit);
     };
 
     const onPointerMove = (e: PointerEvent) => {
@@ -1337,7 +2080,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         const dy = e.clientY - prev.y;
         activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
 
-        // 2-finger pinch zoom + twist orbit + vertical tilt
         if (activePointers.size >= 2) {
           const pts = Array.from(activePointers.values());
           const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
@@ -1378,30 +2120,34 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
       const isTouch = e.pointerType === 'touch';
       const curTool = toolRef.current;
-      const cell = screenToCell(
-        e.clientX,
-        e.clientY,
-        isTouch && curTool.kind !== 'pan' && curTool.kind !== 'inspect'
-      );
-      if (!cell) return;
+      if (curTool.kind === 'pan' || curTool.kind === 'inspect') return;
 
-      lastHoverCell = cell;
+      const hit = raycastTerrainPoint(e.clientX, e.clientY);
+      if (!hit) return;
+
+      lastHoverHit = hit;
 
       if (isTouch && (dragStartCell || curTool.kind === 'building') && activePointers.size === 1) {
-        setTouchReticle({ x: e.clientX, y: e.clientY - 42 });
+        setTouchReticle({ x: e.clientX, y: e.clientY });
       }
 
       if (isTouch && curTool.kind === 'building' && activePointers.size === 1) {
+        const centered = getCenteredFootprintOrigin(
+          hit.hitX,
+          hit.hitZ,
+          curTool.buildingId,
+          rotRef.current
+        );
         const check = engineRef.current.canPlaceStructure(
           curTool.buildingId,
-          cell.x,
-          cell.z,
+          centered.x,
+          centered.z,
           rotRef.current
         );
         const nextPending: PendingMobilePlacement = {
           buildingId: curTool.buildingId,
-          x: cell.x,
-          z: cell.z,
+          x: centered.x,
+          z: centered.z,
           rotation: rotRef.current,
           cost: check.cost,
           valid: check.ok,
@@ -1409,18 +2155,18 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         };
         pendingRef.current = nextPending;
         setPendingPlacement(nextPending);
-        updatePreviewVisuals(null, cell);
+        updatePreviewVisuals(null, hit);
         return;
       }
 
-      updatePreviewVisuals(dragStartCell, cell);
+      updatePreviewVisuals(dragStartCell, hit);
 
       if (dragStartCell && curTool.kind === 'road') {
         const pts = engineRef.current.computeSmartRoadPath(
           dragStartCell.x,
           dragStartCell.z,
-          cell.x,
-          cell.z
+          hit.x,
+          hit.z
         );
         const est = engineRef.current.estimateRoadPathCost(pts, curTool.tier);
         setDragBanner({
@@ -1430,17 +2176,28 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           cost: est.cost,
           valid: est.valid,
           screenX: e.clientX,
-          screenY: isTouch ? e.clientY - 82 : e.clientY - 34,
+          screenY: isTouch ? e.clientY - 64 : e.clientY - 34,
         });
       } else if (dragStartCell && curTool.kind === 'zone') {
-        const count =
-          (Math.abs(cell.x - dragStartCell.x) + 1) * (Math.abs(cell.z - dragStartCell.z) + 1);
+        const evalRes = engineRef.current.evaluateZoneRect(
+          dragStartCell.x,
+          dragStartCell.z,
+          hit.x,
+          hit.z,
+          curTool.zone
+        );
+        const isClear = curTool.zone === ZoneKind.None;
         setDragBanner({
-          label: `${ZONE_CATALOG[curTool.zone].shortName} (${count} celdas)`,
-          cost: count * ZONE_CATALOG[curTool.zone].costPerCell,
-          valid: true,
+          label:
+            evalRes.validCount === 0
+              ? isClear
+                ? 'Sin zonas para limpiar'
+                : 'Sin acceso directo a calle 2L/4L'
+              : `${ZONE_CATALOG[curTool.zone].shortName} (${evalRes.validCount} válidas)`,
+          cost: evalRes.cost,
+          valid: evalRes.validCount > 0,
           screenX: e.clientX,
-          screenY: isTouch ? e.clientY - 82 : e.clientY - 34,
+          screenY: isTouch ? e.clientY - 64 : e.clientY - 34,
         });
       }
     };
@@ -1459,15 +2216,15 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         return;
       }
 
-      if (dragStartCell && lastHoverCell) {
+      if (dragStartCell && lastHoverHit) {
         const curTool = toolRef.current;
         const eng = engineRef.current;
         if (curTool.kind === 'road') {
           const res = eng.buildRoadPath(
             dragStartCell.x,
             dragStartCell.z,
-            lastHoverCell.x,
-            lastHoverCell.z,
+            lastHoverHit.x,
+            lastHoverHit.z,
             curTool.tier
           );
           if (!res.ok && res.reason) onToast(res.reason, 'warn');
@@ -1476,21 +2233,21 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           const res = eng.paintZoneRect(
             dragStartCell.x,
             dragStartCell.z,
-            lastHoverCell.x,
-            lastHoverCell.z,
+            lastHoverHit.x,
+            lastHoverHit.z,
             curTool.zone
           );
           if (!res.ok && res.reason) onToast(res.reason, 'warn');
           onAfterMutate();
         } else if (curTool.kind === 'bulldoze') {
-          eng.bulldozeArea(dragStartCell.x, dragStartCell.z, lastHoverCell.x, lastHoverCell.z);
+          eng.bulldozeArea(dragStartCell.x, dragStartCell.z, lastHoverHit.x, lastHoverHit.z);
           onAfterMutate();
         } else if (curTool.kind === 'metro_tunnel') {
           const res = eng.buildMetroTunnel(
             dragStartCell.x,
             dragStartCell.z,
-            lastHoverCell.x,
-            lastHoverCell.z
+            lastHoverHit.x,
+            lastHoverHit.z
           );
           if (!res.ok && res.reason) onToast(res.reason, 'warn');
           onAfterMutate();
@@ -1560,6 +2317,13 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
     dom.addEventListener('webglcontextlost', onContextLost);
     dom.addEventListener('webglcontextrestored', onContextRestored);
 
+    const getRoadSurfaceY = (eng: CityEngine, rx: number, rz: number): number => {
+      const cx = Math.max(0, Math.min(GRID_SIZE - 1, rx));
+      const cz = Math.max(0, Math.min(GRID_SIZE - 1, rz));
+      const ci = eng.idx(cx, cz);
+      return isWaterTerrain(eng.terrain[ci]) ? 1.77 : surfaceHeightAt(eng, cx, cz) + 0.135;
+    };
+
     const animate = (now: number) => {
       rafId = requestAnimationFrame(animate);
       if (document.visibilityState === 'hidden') {
@@ -1571,7 +2335,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
       const eng = engineRef.current;
 
-      // Sync terrain & static meshes only when mutated or city switched
       if (syncedCityId !== eng.cityId) {
         syncedCityId = eng.cityId;
         rebuildTerrainVertices(eng);
@@ -1639,39 +2402,78 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       );
       camera.lookAt(camState.targetX, 0.8, camState.targetZ);
 
-      // Day / Sunset / Night Lighting & Lit Skyscraper Windows
-      const hr = eng.timeOfDay; // 0..24
+      // Animate water ripples & coastal shoreline foam
+      assets.waterNormalTex.offset.x = (now * 0.000018) % 1;
+      assets.waterNormalTex.offset.y = (now * 0.000012) % 1;
+      if (shoreFoamMesh.visible) {
+        shoreFoamMat.opacity = 0.56 + Math.sin(now * 0.0022) * 0.16;
+      }
+
+      // Day / Sunset / Night Lighting, Sky Dome, Shadows & Streetlights
+      const hr = eng.timeOfDay;
       const sunAngle = ((hr - 6) / 24) * Math.PI * 2;
-      const sunElev = Math.sin(sunAngle); // >0 day, <0 night
+      const sunElev = Math.sin(sunAngle);
       const nightFactor = THREE.MathUtils.clamp(-sunElev * 1.6 + 0.25, 0, 1);
 
-      if (overlayRef.current !== 'normal' && overlayRef.current !== 'metro') {
+      const isAnalyticalWhite = overlayRef.current !== 'normal' && overlayRef.current !== 'metro';
+
+      if (isAnalyticalWhite) {
+        skyDomeMesh.visible = false;
         scene.background = _color.setHex(0xe2e8f0);
         (scene.fog as THREE.FogExp2).color.setHex(0xe2e8f0);
+        sunLight.castShadow = false;
         sunLight.intensity = 1.25;
         hemiLight.intensity = 1.1;
-        bldgRealisticMat.emissiveIntensity = 0;
+        fillLight.intensity = 0.2;
+        rciResMat.emissiveIntensity = 0;
+        rciComMat.emissiveIntensity = 0;
+        rciIndMat.emissiveIntensity = 0;
+        streetLightBulbMesh.visible = false;
       } else {
-        const daySky = new THREE.Color(eng.weather === 'rain' ? '#64748b' : '#7dd3fc');
-        const sunsetSky = new THREE.Color('#fb923c');
-        const nightSky = new THREE.Color('#070d19');
+        skyDomeMesh.visible = true;
+        const sunsetAmt = Math.abs(sunElev) < 0.28 ? 1 - Math.abs(sunElev) / 0.28 : 0;
 
-        const skyCol = daySky.clone();
-        if (Math.abs(sunElev) < 0.28) {
-          skyCol.lerp(sunsetSky, 1 - Math.abs(sunElev) / 0.28);
+        zenithCol.set(eng.weather === 'rain' ? '#475569' : '#0284c7');
+        zenithCol.lerp(new THREE.Color('#7c2d12'), sunsetAmt * 0.45);
+        zenithCol.lerp(new THREE.Color('#020617'), nightFactor);
+
+        horizonCol.set(eng.weather === 'rain' ? '#64748b' : '#bae6fd');
+        horizonCol.lerp(new THREE.Color('#fb923c'), sunsetAmt * 0.85);
+        horizonCol.lerp(new THREE.Color('#0f172a'), nightFactor);
+
+        midSkyCol.copy(horizonCol).lerp(zenithCol, 0.35);
+        scene.background = midSkyCol;
+        (scene.fog as THREE.FogExp2).color.copy(midSkyCol);
+
+        const skyKey = `${Math.round(hr * 8)}_${eng.weather}`;
+        if (skyKey !== lastSkyKey) {
+          lastSkyKey = skyKey;
+          updateSkyDome(zenithCol, horizonCol);
         }
-        skyCol.lerp(nightSky, nightFactor);
-        scene.background = skyCol;
-        (scene.fog as THREE.FogExp2).color.copy(skyCol);
 
+        // Quantize shadow camera target to shadow texel grid to prevent shadow swimming
+        const texelSnap = (SHADOW_HALF_EXTENT * 2) / shadowRes;
+        const qx = Math.round(camState.targetX / texelSnap) * texelSnap;
+        const qz = Math.round(camState.targetZ / texelSnap) * texelSnap;
+        sunLight.castShadow = overlayRef.current === 'normal';
+        sunLight.target.position.set(qx, 0, qz);
+        sunLight.target.updateMatrixWorld();
         sunLight.position.set(
-          WORLD_CENTER + Math.cos(sunAngle) * 75,
-          Math.max(14, Math.abs(sunElev) * 88),
-          WORLD_CENTER + 30
+          qx + Math.cos(sunAngle) * 72,
+          Math.max(18, Math.abs(sunElev) * 86),
+          qz + 32
         );
-        sunLight.intensity = THREE.MathUtils.lerp(1.65, 0.22, nightFactor);
-        hemiLight.intensity = THREE.MathUtils.lerp(0.88, 0.34, nightFactor);
-        bldgRealisticMat.emissiveIntensity = nightFactor * 1.35;
+
+        sunLight.color.set('#fff7ed').lerp(new THREE.Color('#fdba74'), sunsetAmt * 0.65);
+        sunLight.color.lerp(new THREE.Color('#93c5fd'), nightFactor * 0.75);
+        sunLight.intensity = THREE.MathUtils.lerp(1.75, 0.32, nightFactor);
+        hemiLight.intensity = THREE.MathUtils.lerp(0.84, 0.36, nightFactor);
+        fillLight.intensity = THREE.MathUtils.lerp(0.36, 0.22, nightFactor);
+
+        rciResMat.emissiveIntensity = nightFactor * 1.35;
+        rciComMat.emissiveIntensity = nightFactor * 1.45;
+        rciIndMat.emissiveIntensity = nightFactor * 1.2;
+        streetLightBulbMesh.visible = overlayRef.current === 'normal' && nightFactor > 0.25;
       }
 
       // Spin Wind Turbine Blades
@@ -1690,28 +2492,20 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       turbineBladeMesh.count = bladeSlot;
       if (bladeSlot > 0) turbineBladeMesh.instanceMatrix.needsUpdate = true;
 
-      // Commercial Airplane Take-off & Landing Loop on International Airport
+      // Commercial Airplane Take-off & Landing Loop
       if (airportCoords) {
         airplaneGroup.visible = true;
-        const cycle = (now * 0.00018) % 1; // 0..1 loop
+        const cycle = (now * 0.00018) % 1;
         const rx = airportCoords.x - 16 + cycle * 32;
         const climb =
-          cycle < 0.32
-            ? (0.32 - cycle) * 14
-            : cycle > 0.68
-            ? (cycle - 0.68) * 16
-            : 0;
+          cycle < 0.32 ? (0.32 - cycle) * 14 : cycle > 0.68 ? (cycle - 0.68) * 16 : 0;
         airplaneGroup.position.set(rx, airportCoords.y + climb, airportCoords.z);
-        airplaneGroup.rotation.set(
-          0,
-          0,
-          cycle < 0.32 ? -0.14 : cycle > 0.68 ? 0.18 : 0
-        );
+        airplaneGroup.rotation.set(0, 0, cycle < 0.32 ? -0.14 : cycle > 0.68 ? 0.18 : 0);
       } else {
         airplaneGroup.visible = false;
       }
 
-      // Live Road Traffic Vehicles + Bus Fleet
+      // Live Road Traffic Vehicles with Smooth Slope Interpolation, Taillights & Sirens
       const desiredCars = Math.min(
         isMobileTouch ? 140 : 280,
         Math.max(8, Math.floor(roadCellsList.length * 0.22 + eng.population * 0.015))
@@ -1734,6 +2528,8 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         vehicles.push({
           x: vx,
           z: vz,
+          nx: vx,
+          nz: vz,
           dirIdx: Math.floor(Math.random() * 8),
           progress: Math.random(),
           speed: 1.6 + Math.random() * 1.1,
@@ -1747,9 +2543,12 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         });
       }
 
-      const speedMult = eng.simSpeed === 0 ? 0 : eng.simSpeed === 1 ? 1 : eng.simSpeed === 2 ? 1.6 : 2.3;
+      const speedMult =
+        eng.simSpeed === 0 ? 0 : eng.simSpeed === 1 ? 1 : eng.simSpeed === 2 ? 1.6 : 2.3;
       let vehSlot = 0;
       let lightSlot = 0;
+      let tailSlot = 0;
+      let sirenSlot = 0;
 
       for (let idx = 0; idx < vehicles.length && vehSlot < 370; idx++) {
         const v = vehicles[idx];
@@ -1760,13 +2559,14 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
             const pick = roadCellsList[idx % roadCellsList.length];
             v.x = pick % GRID_SIZE;
             v.z = Math.floor(pick / GRID_SIZE);
+            v.nx = v.x;
+            v.nz = v.z;
           }
           continue;
         }
 
         let dir = DIR_OFFSETS[v.dirIdx];
         if ((mask & dir.bit) === 0) {
-          // Pick a connected outgoing arm
           for (let k = 0; k < 8; k++) {
             const cand = (v.dirIdx + k) % 8;
             if ((mask & DIR_OFFSETS[cand].bit) !== 0) {
@@ -1777,16 +2577,16 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           }
         }
 
+        v.nx = Math.max(0, Math.min(GRID_SIZE - 1, v.x + dir.dx));
+        v.nz = Math.max(0, Math.min(GRID_SIZE - 1, v.z + dir.dz));
         v.progress += dt * v.speed * speedMult;
+
         if (v.progress >= 1) {
           v.progress -= 1;
-          const nx = v.x + dir.dx;
-          const nz = v.z + dir.dz;
-          if (eng.inBounds(nx, nz) && eng.roadTier[eng.idx(nx, nz)] !== RoadTier.None) {
-            v.x = nx;
-            v.z = nz;
-            const nMask = eng.roadMask[eng.idx(nx, nz)];
-            // Prefer continuing straight or turning smoothly (avoid U-turn unless dead-end)
+          if (eng.inBounds(v.nx, v.nz) && eng.roadTier[eng.idx(v.nx, v.nz)] !== RoadTier.None) {
+            v.x = v.nx;
+            v.z = v.nz;
+            const nMask = eng.roadMask[eng.idx(v.x, v.z)];
             const candidates: number[] = [];
             for (let k = 0; k < 8; k++) {
               if ((nMask & DIR_OFFSETS[k].bit) !== 0 && DIR_OFFSETS[k].bit !== dir.opp) {
@@ -1798,51 +2598,76 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
             } else {
               v.dirIdx = DIR_OFFSETS.findIndex((d) => d.bit === dir.opp);
             }
+            const nextDir = DIR_OFFSETS[Math.max(0, v.dirIdx)];
+            v.nx = Math.max(0, Math.min(GRID_SIZE - 1, v.x + nextDir.dx));
+            v.nz = Math.max(0, Math.min(GRID_SIZE - 1, v.z + nextDir.dz));
           }
         }
 
         const curDir = DIR_OFFSETS[Math.max(0, v.dirIdx)];
         const angle = Math.atan2(curDir.dx, curDir.dz);
-        // Right-hand lane offset
         const perpX = Math.cos(angle) * 0.14;
         const perpZ = -Math.sin(angle) * 0.14;
         const wx = v.x + curDir.dx * v.progress + perpX;
         const wz = v.z + curDir.dz * v.progress + perpZ;
-        const onBridge = isWaterTerrain(eng.terrain[cellIdx]);
-        const wy = onBridge ? 1.79 : surfaceHeightAt(eng, v.x, v.z) + 0.15;
 
+        const y0 = getRoadSurfaceY(eng, v.x, v.z);
+        const y1 =
+          eng.inBounds(v.nx, v.nz) && eng.roadTier[eng.idx(v.nx, v.nz)] !== RoadTier.None
+            ? getRoadSurfaceY(eng, v.nx, v.nz)
+            : y0;
+        const wy = y0 + (y1 - y0) * v.progress;
+        const stepDist = curDir.diag ? Math.SQRT2 : 1.0;
+        const pitchTilt = -Math.atan2(y1 - y0, stepDist);
+
+        const isHeavy = v.kind === 'truck' || v.kind === 'fire';
         _dummy.position.set(wx, wy, wz);
-        _dummy.rotation.set(0, angle, 0);
-        _dummy.scale.set(
-          0.16,
-          v.kind === 'truck' || v.kind === 'fire' ? 0.19 : 0.12,
-          v.kind === 'truck' || v.kind === 'fire' ? 0.38 : 0.28
-        );
+        _dummy.rotation.set(pitchTilt, angle, 0);
+        _dummy.scale.set(isHeavy ? 1.1 : 1.0, isHeavy ? 1.38 : 1.0, isHeavy ? 1.25 : 1.0);
         _dummy.updateMatrix();
         vehicleMesh.setMatrixAt(vehSlot, _dummy.matrix);
         _color.setHex(v.colorHex);
         vehicleMesh.setColorAt(vehSlot, _color);
         vehSlot++;
 
-        if (nightFactor > 0.35 && lightSlot < 410) {
-          _dummy2.position.set(
-            wx + Math.sin(angle) * 0.22,
-            wy + 0.04,
-            wz + Math.cos(angle) * 0.22
-          );
+        // Emergency rooftop alternating red/blue beacon
+        if ((v.kind === 'police' || v.kind === 'fire') && sirenSlot < 118) {
+          _dummy2.position.set(wx, wy + (isHeavy ? 0.22 : 0.165), wz);
           _dummy2.rotation.set(0, angle, 0);
-          _dummy2.scale.set(0.14, 0.04, 0.18);
+          _dummy2.scale.set(0.08, 0.04, 0.08);
+          _dummy2.updateMatrix();
+          sirenBeaconMesh.setMatrixAt(sirenSlot, _dummy2.matrix);
+          const flashBlue = Math.floor(now * 0.012 + idx) % 2 === 0;
+          _color.setHex(v.kind === 'fire' || !flashBlue ? 0xef4444 : 0x38bdf8);
+          sirenBeaconMesh.setColorAt(sirenSlot, _color);
+          sirenSlot++;
+        }
+
+        if (nightFactor > 0.35 && lightSlot < 410 && tailSlot < 410) {
+          const fSin = Math.sin(angle);
+          const fCos = Math.cos(angle);
+          _dummy2.position.set(wx + fSin * 0.22, wy + 0.05, wz + fCos * 0.22);
+          _dummy2.rotation.set(0, angle, 0);
+          _dummy2.scale.set(0.13, 0.035, 0.16);
           _dummy2.updateMatrix();
           headlightMesh.setMatrixAt(lightSlot++, _dummy2.matrix);
+
+          _dummy2.position.set(wx - fSin * 0.17, wy + 0.05, wz - fCos * 0.17);
+          _dummy2.rotation.set(0, angle, 0);
+          _dummy2.scale.set(0.12, 0.03, 0.04);
+          _dummy2.updateMatrix();
+          taillightMesh.setMatrixAt(tailSlot++, _dummy2.matrix);
         }
       }
 
-      // Add Articulated City Buses along active Bus Lines!
+      // Articulated City Buses
       for (let li = 0; li < eng.busLines.length; li++) {
         const line = eng.busLines[li];
         if (line.stops.length < 2) continue;
         for (let b = 0; b < 2 && vehSlot < 418; b++) {
-          const t = ((now * 0.00028 * Math.max(0.2, speedMult) + b * 0.5 + li * 0.23) % 1) * line.stops.length;
+          const t =
+            ((now * 0.00028 * Math.max(0.2, speedMult) + b * 0.5 + li * 0.23) % 1) *
+            line.stops.length;
           const idxA = Math.floor(t) % line.stops.length;
           const idxB = (idxA + 1) % line.stops.length;
           const frac = t - Math.floor(t);
@@ -1853,12 +2678,12 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           const ang = Math.atan2(c.x - a.x, c.z - a.z);
           const cellI = eng.idx(Math.round(bx), Math.round(bz));
           const by = isWaterTerrain(eng.terrain[cellI])
-            ? 1.82
-            : surfaceHeightAt(eng, Math.round(bx), Math.round(bz)) + 0.17;
+            ? 1.79
+            : surfaceHeightAt(eng, Math.round(bx), Math.round(bz)) + 0.14;
 
           _dummy.position.set(bx, by, bz);
           _dummy.rotation.set(0, ang, 0);
-          _dummy.scale.set(0.22, 0.24, 0.58);
+          _dummy.scale.set(1.35, 1.55, 1.85);
           _dummy.updateMatrix();
           vehicleMesh.setMatrixAt(vehSlot, _dummy.matrix);
           _color.set(line.color);
@@ -1874,11 +2699,20 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       headlightMesh.count = lightSlot;
       if (lightSlot > 0) headlightMesh.instanceMatrix.needsUpdate = true;
 
-      // Underground Metro Trains along tunnels (Y = -2.1)
+      taillightMesh.count = tailSlot;
+      if (tailSlot > 0) taillightMesh.instanceMatrix.needsUpdate = true;
+
+      sirenBeaconMesh.count = sirenSlot;
+      if (sirenSlot > 0) {
+        sirenBeaconMesh.instanceMatrix.needsUpdate = true;
+        if (sirenBeaconMesh.instanceColor) sirenBeaconMesh.instanceColor.needsUpdate = true;
+      }
+
+      // Underground Metro Trains (Y = -2.05)
       let trainSlot = 0;
       for (let mi = 0; mi < eng.metroSegments.length && trainSlot < 115; mi++) {
         const seg = eng.metroSegments[mi];
-        const pingPong = Math.abs((((now * 0.00045 * Math.max(0.25, speedMult) + mi * 0.37) % 2) - 1));
+        const pingPong = Math.abs(((now * 0.00045 * Math.max(0.25, speedMult) + mi * 0.37) % 2) - 1);
         const tx = seg.fromX + (seg.toX - seg.fromX) * pingPong;
         const tz = seg.fromZ + (seg.toZ - seg.fromZ) * pingPong;
         const ang = Math.atan2(seg.toX - seg.fromX, seg.toZ - seg.fromZ);
@@ -1891,10 +2725,8 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       metroTrainMesh.count = trainSlot;
       if (trainSlot > 0) metroTrainMesh.instanceMatrix.needsUpdate = true;
 
-      // FX Particles: Fires, Tornado Funnel, Meteor, Rain & Wind Arrows in Pollution Overlay
+      // FX Particles (Fires, Disasters, Wind Streaks, Rain)
       let fxSlot = 0;
-
-      // Active cell fires
       for (let i = 0; i < TOTAL_CELLS && fxSlot < 500; i += 1) {
         if (eng.cellFire[i] === 0) continue;
         const fx = i % GRID_SIZE;
@@ -1911,7 +2743,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         fxSlot++;
       }
 
-      // Active Disasters (Tornado vortex / Meteor fireball)
       for (const d of eng.activeDisasters) {
         if (d.kind === 'tornado') {
           for (let ring = 0; ring < 18 && fxSlot < 620; ring++) {
@@ -1939,7 +2770,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
         }
       }
 
-      // Wind direction streaks in Pollution overlay
       if (overlayRef.current === 'pollution') {
         const wx = Math.cos(eng.windAngleRad);
         const wz = Math.sin(eng.windAngleRad);
@@ -1958,7 +2788,6 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
           fxSlot++;
         }
       } else if (eng.weather === 'rain') {
-        // Atmospheric rain streaks around camera target
         for (let r = 0; r < 90 && fxSlot < 645; r++) {
           const rx = camState.targetX + (((r * 19) % 44) - 22);
           const rz = camState.targetZ + (((r * 31) % 44) - 22);
@@ -1998,6 +2827,31 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('resize', onResize);
+
+      // Dispose GPU geometries & scene-owned materials/textures cleanly
+      skyGeo.dispose();
+      skyMat.dispose();
+      terrainGeo.dispose();
+      terrainNormalMat.dispose();
+      terrainInfoMat.dispose();
+      overlayDataTex.dispose();
+      waterGeo.dispose();
+      waterMat.dispose();
+      shoreFoamGeo.dispose();
+      shoreFoamMat.dispose();
+      shoreFoamTex.dispose();
+      rciResMat.dispose();
+      rciComMat.dispose();
+      rciIndMat.dispose();
+      solidRealisticMat.dispose();
+      whiteInfoMat.dispose();
+      streetBulbMat.dispose();
+      boxGeo.dispose();
+      cylGeo.dispose();
+      coneGeo.dispose();
+      broadGeo.dispose();
+      vehicleMergedGeo.dispose();
+
       renderer.dispose();
       if (dom.parentElement === host) {
         host.removeChild(dom);
@@ -2007,16 +2861,15 @@ export const CityViewport3D: React.FC<CityViewport3DProps> = ({
 
   return (
     <div ref={hostRef} className="city-canvas-host relative w-full h-full overflow-hidden">
-      {/* Touch Offset Reticle (+42px above thumb so finger never blocks target cell) */}
+      {/* Exact 1:1 Contact Reticle directly on finger touch point */}
       {touchReticle && (
         <div
           className="pointer-events-none fixed z-30 -translate-x-1/2 -translate-y-1/2"
           style={{ left: touchReticle.x, top: touchReticle.y }}
         >
-          <div className="w-8 h-8 rounded-full border-2 border-sky-400 bg-sky-400/20 shadow-[0_0_14px_rgba(56,189,248,0.85)] flex items-center justify-center">
+          <div className="w-7 h-7 rounded-full border-2 border-sky-400 bg-sky-400/20 shadow-[0_0_12px_rgba(56,189,248,0.85)] flex items-center justify-center">
             <div className="w-1.5 h-1.5 rounded-full bg-white" />
           </div>
-          <div className="mx-auto w-0.5 h-9 bg-gradient-to-b from-sky-400 to-transparent" />
         </div>
       )}
 

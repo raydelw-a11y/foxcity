@@ -563,6 +563,7 @@ export class CityEngine {
       }
     }
 
+    this.enforceZoneRoadAccess();
     this.refreshDiagonalZoneAlignment();
     this.recomputeUtilitiesAndCoverage();
     this.meshVersion++;
@@ -593,19 +594,7 @@ export class CityEngine {
     const minZ = Math.max(0, Math.min(z0, z1));
     const maxZ = Math.min(GRID_SIZE - 1, Math.max(z0, z1));
 
-    const targets: number[] = [];
-    for (let z = minZ; z <= maxZ; z++) {
-      for (let x = minX; x <= maxX; x++) {
-        if (!this.isTileUnlockedAt(x, z)) continue;
-        const i = this.idx(x, z);
-        if (isWaterTerrain(this.terrain[i]) || this.terrain[i] === TerrainKind.Mountain) continue;
-        if (this.roadTier[i] !== RoadTier.None || this.structureGrid[i] !== -1) continue;
-        if (this.zones[i] === zone) continue;
-        // Zones should be within 3 cells of a local street or avenue (unless clearing)
-        if (zone !== ZoneKind.None && !this.hasNearbyZoneableRoad(x, z)) continue;
-        targets.push(i);
-      }
-    }
+    const { targets, cost: totalCost } = this.evaluateZoneTargets(minX, maxX, minZ, maxZ, zone);
 
     if (targets.length === 0) {
       return {
@@ -613,12 +602,11 @@ export class CityEngine {
         count: 0,
         reason:
           zone === ZoneKind.None
-            ? 'No hay zonas seleccionadas.'
-            : 'Pinta junto a una Calle 2L o Avenida 4L dentro de tu territorio.',
+            ? 'No hay zonas seleccionadas para limpiar.'
+            : 'Las zonas solo se pueden construir con acceso directo a una Calle 2L o Avenida 4L.',
       };
     }
 
-    const totalCost = targets.length * spec.costPerCell;
     if (!this.sandboxMode && totalCost > this.money) {
       return { ok: false, count: 0, reason: 'Fondos insuficientes para zonificar.' };
     }
@@ -645,20 +633,161 @@ export class CityEngine {
     return { ok: true, count: targets.length };
   }
 
-  public hasNearbyZoneableRoad(x: number, z: number): boolean {
-    for (let dz = -2; dz <= 2; dz++) {
-      for (let dx = -2; dx <= 2; dx++) {
-        if (dx * dx + dz * dz > 5) continue;
-        const nx = x + dx;
-        const nz = z + dz;
-        if (!this.inBounds(nx, nz)) continue;
-        const rt = this.roadTier[this.idx(nx, nz)];
-        if (rt === RoadTier.Local2L || rt === RoadTier.Avenue4L) {
-          return true;
+  private evaluateZoneTargets(
+    minX: number,
+    maxX: number,
+    minZ: number,
+    maxZ: number,
+    zone: ZoneKind
+  ): { targets: number[]; cost: number } {
+    const spec = ZONE_CATALOG[zone];
+    const targets: number[] = [];
+    for (let z = minZ; z <= maxZ; z++) {
+      for (let x = minX; x <= maxX; x++) {
+        if (!this.isTileUnlockedAt(x, z)) continue;
+        const i = this.idx(x, z);
+        if (isWaterTerrain(this.terrain[i]) || this.terrain[i] === TerrainKind.Mountain) continue;
+        if (this.roadTier[i] !== RoadTier.None || this.structureGrid[i] !== -1) continue;
+        if (this.zones[i] === zone) continue;
+        if (zone !== ZoneKind.None && !this.hasDirectRoadAccess(x, z)) continue;
+        targets.push(i);
+      }
+    }
+    return { targets, cost: targets.length * spec.costPerCell };
+  }
+
+  public evaluateZoneRect(
+    x0: number,
+    z0: number,
+    x1: number,
+    z1: number,
+    zone: ZoneKind
+  ): {
+    cells: { x: number; z: number; valid: boolean }[];
+    validCount: number;
+    billableCount: number;
+    cost: number;
+  } {
+    const minX = Math.max(0, Math.min(x0, x1));
+    const maxX = Math.min(GRID_SIZE - 1, Math.max(x0, x1));
+    const minZ = Math.max(0, Math.min(z0, z1));
+    const maxZ = Math.min(GRID_SIZE - 1, Math.max(z0, z1));
+    const spec = ZONE_CATALOG[zone];
+    const cells: { x: number; z: number; valid: boolean }[] = [];
+    let validCount = 0;
+    let billableCount = 0;
+
+    for (let z = minZ; z <= maxZ; z++) {
+      for (let x = minX; x <= maxX; x++) {
+        const i = this.idx(x, z);
+        const unlocked = this.isTileUnlockedAt(x, z);
+        const terrainOk = !isWaterTerrain(this.terrain[i]) && this.terrain[i] !== TerrainKind.Mountain;
+        const free = this.roadTier[i] === RoadTier.None && this.structureGrid[i] === -1;
+
+        let valid = false;
+        let billable = false;
+        if (zone === ZoneKind.None) {
+          valid = unlocked && free && this.zones[i] !== ZoneKind.None;
+          billable = valid;
+        } else {
+          const roadOk = this.hasDirectRoadAccess(x, z);
+          valid = unlocked && terrainOk && free && roadOk;
+          billable = valid && this.zones[i] !== zone;
+        }
+
+        if (valid) validCount++;
+        if (billable) billableCount++;
+        if (cells.length < 1600) {
+          cells.push({ x, z, valid });
         }
       }
     }
+
+    return {
+      cells,
+      validCount,
+      billableCount,
+      cost: billableCount * spec.costPerCell,
+    };
+  }
+
+  /** Strict 4-way orthogonal adjacency to a dry-land Local2L or Avenue4L street. */
+  public hasDirectRoadAccess(x: number, z: number): boolean {
+    const ortho: [number, number][] = [
+      [0, -1],
+      [1, 0],
+      [0, 1],
+      [-1, 0],
+    ];
+    for (const [dx, dz] of ortho) {
+      const nx = x + dx;
+      const nz = z + dz;
+      if (!this.inBounds(nx, nz)) continue;
+      const ni = this.idx(nx, nz);
+      const rt = this.roadTier[ni];
+      if ((rt === RoadTier.Local2L || rt === RoadTier.Avenue4L) && !isWaterTerrain(this.terrain[ni])) {
+        return true;
+      }
+    }
     return false;
+  }
+
+  public hasNearbyZoneableRoad(x: number, z: number): boolean {
+    return this.hasDirectRoadAccess(x, z);
+  }
+
+  /** Returns the Y rotation angle so an RCI building's front (+Z) faces the adjacent road. */
+  public getRoadFacingAngle(x: number, z: number): number {
+    const i = this.idx(x, z);
+    const diag = this.rciDiag[i];
+    if (diag === 1) return Math.PI / 4;
+    if (diag === 2) return -Math.PI / 4;
+
+    const dirs: [number, number, number][] = [
+      [0, 1, 0],
+      [1, 0, Math.PI / 2],
+      [0, -1, Math.PI],
+      [-1, 0, -Math.PI / 2],
+    ];
+    for (const [dx, dz, ang] of dirs) {
+      const nx = x + dx;
+      const nz = z + dz;
+      if (!this.inBounds(nx, nz)) continue;
+      const ni = this.idx(nx, nz);
+      if (this.roadTier[ni] === RoadTier.Avenue4L && !isWaterTerrain(this.terrain[ni])) {
+        return ang;
+      }
+    }
+    for (const [dx, dz, ang] of dirs) {
+      const nx = x + dx;
+      const nz = z + dz;
+      if (!this.inBounds(nx, nz)) continue;
+      const ni = this.idx(nx, nz);
+      if (this.roadTier[ni] === RoadTier.Local2L && !isWaterTerrain(this.terrain[ni])) {
+        return ang;
+      }
+    }
+    return ((this.rciVariant[i] & 3) * Math.PI) / 2;
+  }
+
+  /** Immediately removes any zoned cells or RCI buildings lacking direct road access. */
+  public enforceZoneRoadAccess(): number {
+    let cleared = 0;
+    for (let i = 0; i < TOTAL_CELLS; i++) {
+      if (this.zones[i] === ZoneKind.None) continue;
+      const x = i % GRID_SIZE;
+      const z = Math.floor(i / GRID_SIZE);
+      if (!this.hasDirectRoadAccess(x, z)) {
+        this.zones[i] = ZoneKind.None;
+        this.rciLevel[i] = 0;
+        this.rciProgress[i] = 0;
+        this.rciAbandoned[i] = 0;
+        this.rciDiag[i] = 0;
+        this.cellFire[i] = 0;
+        cleared++;
+      }
+    }
+    return cleared;
   }
 
   private refreshDiagonalZoneAlignment() {
@@ -891,6 +1020,11 @@ export class CityEngine {
       this.structures = this.structures.filter((s) => !structIdsToDelete.has(s.id));
       this.rebuildStructureGrid();
       removed += structIdsToDelete.size;
+    }
+
+    const orphanCleared = this.enforceZoneRoadAccess();
+    if (orphanCleared > 0) {
+      removed += orphanCleared;
     }
 
     if (removed > 0) {
@@ -1140,6 +1274,7 @@ export class CityEngine {
           }
         }
       }
+      this.enforceZoneRoadAccess();
       this.pushChirp(
         'Defensa Civil',
         '@AlertaFox',
@@ -1545,6 +1680,16 @@ export class CityEngine {
         const i = this.idx(x, z);
         const zKind = this.zones[i] as ZoneKind;
         if (zKind === ZoneKind.None) continue;
+        if (!this.hasDirectRoadAccess(x, z)) {
+          this.zones[i] = ZoneKind.None;
+          this.rciLevel[i] = 0;
+          this.rciProgress[i] = 0;
+          this.rciAbandoned[i] = 0;
+          this.rciDiag[i] = 0;
+          this.cellFire[i] = 0;
+          geometryMutated = true;
+          continue;
+        }
         if (this.cellFire[i] > 0) continue;
 
         const hasPower = this.powerMap[i] === 1;
@@ -2065,6 +2210,7 @@ export class CityEngine {
     }
 
     eng.rebuildStructureGrid();
+    eng.enforceZoneRoadAccess();
     eng.refreshDiagonalZoneAlignment();
     eng.recomputeUtilitiesAndCoverage();
     eng.recomputeLandValueAndPollution();

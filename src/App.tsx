@@ -51,6 +51,7 @@ import { CityViewport3D, PendingMobilePlacement } from './renderer/CityViewport3
 import {
   CityHudSnapshot,
   CloudCitySummary,
+  GRID_SIZE,
   InfoOverlayMode,
   MapArchetypeId,
   RoadTier,
@@ -76,7 +77,7 @@ import {
   writeEmergencyWalSync,
 } from './utils/cloudSync';
 
-const FALLBACK_BUILD_TIMESTAMP = '5:17 PM - 11/12/2026';
+const FALLBACK_BUILD_TIMESTAMP = '9:33 PM - 11/12/2026';
 const BUILD_TS =
   typeof __BUILD_TIMESTAMP__ !== 'undefined' ? __BUILD_TIMESTAMP__ : FALLBACK_BUILD_TIMESTAMP;
 
@@ -423,9 +424,20 @@ export const App: React.FC = () => {
       const next = ((prev + 1) % 4) as 0 | 1 | 2 | 3;
       setPendingPlacement((cur) => {
         if (!cur || !engineRef.current) return cur;
-        const check = engineRef.current.canPlaceStructure(cur.buildingId, cur.x, cur.z, next);
+        const spec = BUILDING_SPECS[cur.buildingId];
+        const oldW = cur.rotation % 2 === 1 ? spec.d : spec.w;
+        const oldD = cur.rotation % 2 === 1 ? spec.w : spec.d;
+        const newW = next % 2 === 1 ? spec.d : spec.w;
+        const newD = next % 2 === 1 ? spec.w : spec.d;
+        const cx = cur.x + (oldW - 1) * 0.5;
+        const cz = cur.z + (oldD - 1) * 0.5;
+        const nx = Math.max(0, Math.min(GRID_SIZE - newW, Math.round(cx - (newW - 1) * 0.5)));
+        const nz = Math.max(0, Math.min(GRID_SIZE - newD, Math.round(cz - (newD - 1) * 0.5)));
+        const check = engineRef.current.canPlaceStructure(cur.buildingId, nx, nz, next);
         return {
           ...cur,
+          x: nx,
+          z: nz,
           rotation: next,
           valid: check.ok,
           reason: check.reason,
