@@ -173,6 +173,13 @@ export class CityEngine {
   public powerConsumedMW = 0;
   public waterProducedML = 0;
   public waterConsumedML = 0;
+  public zonedCellsTotal = 0;
+  public unpoweredZones = 0;
+  public unwateredZones = 0;
+  public unservicedZones = 0;
+  public unservicedBuiltCount = 0;
+  public firstUnservicedCell: { x: number; z: number } | null = null;
+  private lastUtilityZoneHash = -1;
   public avgTraffic = 8;
   public avgLandValue = 42;
   public avgPollution = 4;
@@ -219,6 +226,7 @@ export class CityEngine {
     this.trees = gen.trees;
     this.roadTier.set(gen.initialRoadTier);
     this.roadMask.set(gen.initialRoadMask);
+    this.sanitizeRoadTopology();
     this.structureGrid.fill(-1);
 
     if (this.sandboxMode) {
@@ -243,6 +251,21 @@ export class CityEngine {
 
   public idx(x: number, z: number): number {
     return z * GRID_SIZE + x;
+  }
+
+  public hasZoneUtilities(i: number): boolean {
+    return this.powerMap[i] === 1 && this.waterMap[i] === 1;
+  }
+
+  public isZoneOperational(i: number): boolean {
+    return (
+      this.zones[i] !== ZoneKind.None &&
+      this.rciLevel[i] > 0 &&
+      this.powerMap[i] === 1 &&
+      this.waterMap[i] === 1 &&
+      this.rciAbandoned[i] === 0 &&
+      this.cellFire[i] === 0
+    );
   }
 
   public inBounds(x: number, z: number): boolean {
@@ -375,8 +398,11 @@ export class CityEngine {
     this.busLines = snap.busLines;
     this.metroSegments = snap.metroSegments;
     this.rebuildStructureGrid();
+    this.sanitizeRoadTopology();
+    this.refreshDiagonalZoneAlignment();
     this.recomputeUtilitiesAndCoverage();
     this.recomputeLandValueAndPollution();
+    this.recomputePopulationAndEconomy(false);
     this.meshVersion++;
     this.overlayVersion++;
     this.dirtySync = true;
@@ -398,7 +424,7 @@ export class CityEngine {
   }
 
   /**
-   * Computes a smart octilinear path (0°, 45°, 90°, 135°...) from (x0,z0) to (x1,z1).
+   * Computes a clean single-bend octilinear path (0°, 45°, 90°, 135°) from (x0,z0) to (x1,z1).
    */
   public computeSmartRoadPath(
     x0: number,
@@ -413,34 +439,74 @@ export class CityEngine {
     const tz = Math.max(0, Math.min(GRID_SIZE - 1, z1));
 
     path.push({ x: cx, z: cz });
-    let guard = 0;
-    while ((cx !== tx || cz !== tz) && guard < 240) {
-      guard++;
-      const remX = tx - cx;
-      const remZ = tz - cz;
-      const absX = Math.abs(remX);
-      const absZ = Math.abs(remZ);
-      const sx = Math.sign(remX);
-      const sz = Math.sign(remZ);
+    const dxTotal = tx - cx;
+    const dzTotal = tz - cz;
+    const ax = Math.abs(dxTotal);
+    const az = Math.abs(dzTotal);
+    const sx = Math.sign(dxTotal);
+    const sz = Math.sign(dzTotal);
 
-      // Pure 45-deg diagonal when |dx| == |dz| or close octilinear corner
-      if (absX > 0 && absZ > 0 && (absX === absZ || Math.min(absX, absZ) >= 2)) {
-        // Check diagonal X-crossing conflict before taking diagonal step
-        if (!this.hasCrossingDiagonal(cx, cz, cx + sx, cz + sz)) {
-          cx += sx;
-          cz += sz;
-          path.push({ x: cx, z: cz });
-          continue;
-        }
-      }
-
-      if (absX >= absZ && sx !== 0) {
-        cx += sx;
-      } else if (sz !== 0) {
-        cz += sz;
-      }
+    const stepOrtho = (dx: number, dz: number) => {
+      if (dx === 0 && dz === 0) return;
+      cx += dx;
+      cz += dz;
       path.push({ x: cx, z: cz });
+    };
+
+    const stepDiagOrSplit = (dx: number, dz: number) => {
+      if (!this.hasCrossingDiagonal(cx, cz, cx + dx, cz + dz)) {
+        cx += dx;
+        cz += dz;
+        path.push({ x: cx, z: cz });
+      } else {
+        stepOrtho(dx, 0);
+        stepOrtho(0, dz);
+      }
+    };
+
+    const diagSteps = Math.min(ax, az);
+    const orthoSteps = Math.abs(ax - az);
+
+    if (diagSteps === 0) {
+      for (let i = 0; i < ax; i++) stepOrtho(sx, 0);
+      for (let i = 0; i < az; i++) stepOrtho(0, sz);
+      return path;
     }
+
+    // Pure L-bend (90 deg) when diagonal deviation is only 1 cell along a longer run
+    if (diagSteps === 1 && orthoSteps >= 2) {
+      if (ax >= az) {
+        for (let i = 0; i < ax; i++) stepOrtho(sx, 0);
+        for (let i = 0; i < az; i++) stepOrtho(0, sz);
+      } else {
+        for (let i = 0; i < az; i++) stepOrtho(0, sz);
+        for (let i = 0; i < ax; i++) stepOrtho(sx, 0);
+      }
+      return path;
+    }
+
+    const odx = ax >= az ? sx : 0;
+    const odz = az > ax ? sz : 0;
+
+    // Check if origin cell is extending an existing collinear diagonal
+    const startIdx = this.idx(cx, cz);
+    const backDiag = DIR_OFFSETS.find((d) => d.diag && d.dx === -sx && d.dz === -sz);
+    const diagMask = DIR_NE | DIR_NW | DIR_SE | DIR_SW;
+    const orthoMask = DIR_N | DIR_S | DIR_E | DIR_W;
+    const startMask = this.roadMask[startIdx];
+    const continueDiagFirst =
+      Boolean(backDiag && (startMask & backDiag.bit) !== 0) &&
+      (startMask & orthoMask) === 0 &&
+      (startMask & diagMask) !== 0;
+
+    if (continueDiagFirst) {
+      for (let i = 0; i < diagSteps; i++) stepDiagOrSplit(sx, sz);
+      for (let i = 0; i < orthoSteps; i++) stepOrtho(odx, odz);
+    } else {
+      for (let i = 0; i < orthoSteps; i++) stepOrtho(odx, odz);
+      for (let i = 0; i < diagSteps; i++) stepDiagOrSplit(sx, sz);
+    }
+
     return path;
   }
 
@@ -523,6 +589,8 @@ export class CityEngine {
     this.pushUndoSnapshot();
     if (!this.sandboxMode) this.money -= est.cost;
 
+    const hadRoadBefore = path.map((pt) => this.roadTier[this.idx(pt.x, pt.z)] !== RoadTier.None);
+
     for (let k = 0; k < path.length; k++) {
       const cur = path[k];
       const i = this.idx(cur.x, cur.z);
@@ -547,30 +615,141 @@ export class CityEngine {
           this.roadMask[i] |= dir.opp;
         }
       }
-
-      // Auto-snap orthogonal adjacent existing roads for instant clean T / Cross intersections
-      for (const ortho of DIR_OFFSETS) {
-        if (ortho.diag) continue;
-        const nx = cur.x + ortho.dx;
-        const nz = cur.z + ortho.dz;
-        if (this.inBounds(nx, nz)) {
-          const ni = this.idx(nx, nz);
-          if (this.roadTier[ni] !== RoadTier.None) {
-            this.roadMask[i] |= ortho.bit;
-            this.roadMask[ni] |= ortho.opp;
-          }
-        }
-      }
     }
 
+    // Snap endpoints cleanly ONLY if the endpoint was new & open (avoids parallel road ladders & 1x1 triangles)
+    const snapEndpoint = (k: number, prefDx: number, prefDz: number) => {
+      if (hadRoadBefore[k]) return;
+      const cur = path[k];
+      const i = this.idx(cur.x, cur.z);
+      let bitCount = 0;
+      for (const d of DIR_OFFSETS) {
+        if ((this.roadMask[i] & d.bit) !== 0) bitCount++;
+      }
+      if (bitCount > 1) return;
+
+      // 1st priority: collinear continuation; 2nd priority: perpendicular ortho neighbor
+      const candidates = DIR_OFFSETS.filter((d) => !d.diag).sort((a, b) => {
+        const scoreA = a.dx === prefDx && a.dz === prefDz ? 0 : 1;
+        const scoreB = b.dx === prefDx && b.dz === prefDz ? 0 : 1;
+        return scoreA - scoreB;
+      });
+      for (const ortho of candidates) {
+        const nx = cur.x + ortho.dx;
+        const nz = cur.z + ortho.dz;
+        if (!this.inBounds(nx, nz)) continue;
+        const ni = this.idx(nx, nz);
+        if (this.roadTier[ni] !== RoadTier.None && (this.roadMask[i] & ortho.bit) === 0) {
+          this.roadMask[i] |= ortho.bit;
+          this.roadMask[ni] |= ortho.opp;
+          break;
+        }
+      }
+    };
+
+    if (path.length >= 2) {
+      snapEndpoint(0, path[0].x - path[1].x, path[0].z - path[1].z);
+      const last = path.length - 1;
+      snapEndpoint(last, path[last].x - path[last - 1].x, path[last].z - path[last - 1].z);
+    } else if (path.length === 1 && !hadRoadBefore[0]) {
+      snapEndpoint(0, 0, 0);
+    }
+
+    this.sanitizeRoadTopology();
     this.enforceZoneRoadAccess();
     this.refreshDiagonalZoneAlignment();
     this.recomputeUtilitiesAndCoverage();
+    this.recomputeLandValueAndPollution();
+    this.recomputePopulationAndEconomy(false);
     this.meshVersion++;
     this.overlayVersion++;
     this.dirtySync = true;
     soundFX.playRoadPlace(est.hasBridge);
     return { ok: true };
+  }
+
+  /**
+   * Ensures reciprocal bitmasks and removes redundant diagonal chords across connected 90° L-corners
+   * so curves never render overlapping 1x1 triangles.
+   */
+  public sanitizeRoadTopology(): void {
+    // Pass 1: Clear stale bits & enforce reciprocity
+    for (let z = 0; z < GRID_SIZE; z++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const i = this.idx(x, z);
+        if (this.roadTier[i] === RoadTier.None) {
+          this.roadMask[i] = 0;
+          continue;
+        }
+        let m = this.roadMask[i];
+        for (const d of DIR_OFFSETS) {
+          if ((m & d.bit) === 0) continue;
+          const nx = x + d.dx;
+          const nz = z + d.dz;
+          if (!this.inBounds(nx, nz) || this.roadTier[this.idx(nx, nz)] === RoadTier.None) {
+            m &= ~d.bit;
+          } else {
+            this.roadMask[this.idx(nx, nz)] |= d.opp;
+          }
+        }
+        this.roadMask[i] = m;
+      }
+    }
+
+    // Pass 2: Break redundant diagonal chords closing a 1x1 right triangle (A-B diagonal when A-C-B ortho exists)
+    const diagChecks: {
+      bit: number;
+      opp: number;
+      dx: number;
+      dz: number;
+      c1FromA: number;
+      c1ToB: number;
+      c2FromA: number;
+      c2ToB: number;
+    }[] = [
+      { bit: DIR_NE, opp: DIR_SW, dx: 1, dz: -1, c1FromA: DIR_N, c1ToB: DIR_E, c2FromA: DIR_E, c2ToB: DIR_N },
+      { bit: DIR_SE, opp: DIR_NW, dx: 1, dz: 1, c1FromA: DIR_S, c1ToB: DIR_E, c2FromA: DIR_E, c2ToB: DIR_S },
+      { bit: DIR_SW, opp: DIR_NE, dx: -1, dz: 1, c1FromA: DIR_S, c1ToB: DIR_W, c2FromA: DIR_W, c2ToB: DIR_S },
+      { bit: DIR_NW, opp: DIR_SE, dx: -1, dz: -1, c1FromA: DIR_N, c1ToB: DIR_W, c2FromA: DIR_W, c2ToB: DIR_N },
+    ];
+
+    for (let z = 0; z < GRID_SIZE; z++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const i = this.idx(x, z);
+        if (this.roadTier[i] === RoadTier.None) continue;
+        const m = this.roadMask[i];
+        for (const dc of diagChecks) {
+          if ((m & dc.bit) === 0) continue;
+          const bx = x + dc.dx;
+          const bz = z + dc.dz;
+          if (!this.inBounds(bx, bz)) continue;
+          const bi = this.idx(bx, bz);
+
+          // Check corner 1: (x, z + dz) connected from A via c1FromA and to B via c1ToB
+          const c1x = x;
+          const c1z = z + dc.dz;
+          const c1HasPath =
+            this.inBounds(c1x, c1z) &&
+            this.roadTier[this.idx(c1x, c1z)] !== RoadTier.None &&
+            (m & dc.c1FromA) !== 0 &&
+            (this.roadMask[this.idx(c1x, c1z)] & dc.c1ToB) !== 0;
+
+          // Check corner 2: (x + dx, z) connected from A via c2FromA and to B via c2ToB
+          const c2x = x + dc.dx;
+          const c2z = z;
+          const c2HasPath =
+            this.inBounds(c2x, c2z) &&
+            this.roadTier[this.idx(c2x, c2z)] !== RoadTier.None &&
+            (m & dc.c2FromA) !== 0 &&
+            (this.roadMask[this.idx(c2x, c2z)] & dc.c2ToB) !== 0;
+
+          if (c1HasPath || c2HasPath) {
+            this.roadMask[i] &= ~dc.bit;
+            this.roadMask[bi] &= ~dc.opp;
+          }
+        }
+      }
+    }
   }
 
   public paintZoneRect(
@@ -626,6 +805,9 @@ export class CityEngine {
     }
 
     this.refreshDiagonalZoneAlignment();
+    this.recomputeUtilitiesAndCoverage();
+    this.recomputeLandValueAndPollution();
+    this.recomputePopulationAndEconomy(false);
     this.meshVersion++;
     this.overlayVersion++;
     this.dirtySync = true;
@@ -933,6 +1115,7 @@ export class CityEngine {
 
     this.recomputeUtilitiesAndCoverage();
     this.recomputeLandValueAndPollution();
+    this.recomputePopulationAndEconomy(false);
     this.meshVersion++;
     this.overlayVersion++;
     this.dirtySync = true;
@@ -1028,9 +1211,11 @@ export class CityEngine {
     }
 
     if (removed > 0) {
+      this.sanitizeRoadTopology();
       this.refreshDiagonalZoneAlignment();
       this.recomputeUtilitiesAndCoverage();
       this.recomputeLandValueAndPollution();
+      this.recomputePopulationAndEconomy(false);
       this.meshVersion++;
       this.overlayVersion++;
       this.dirtySync = true;
@@ -1274,7 +1459,12 @@ export class CityEngine {
           }
         }
       }
+      this.sanitizeRoadTopology();
       this.enforceZoneRoadAccess();
+      this.refreshDiagonalZoneAlignment();
+      this.recomputeUtilitiesAndCoverage();
+      this.recomputeLandValueAndPollution();
+      this.recomputePopulationAndEconomy(false);
       this.pushChirp(
         'Defensa Civil',
         '@AlertaFox',
@@ -1459,6 +1649,52 @@ export class CityEngine {
       s.powered = this.powerMap[i] === 1 || BUILDING_SPECS[s.buildingId].powerMW > 0;
       s.watered = this.waterMap[i] === 1 || BUILDING_SPECS[s.buildingId].waterML >= 0;
     }
+
+    // Telemetry + rolling hash of utility coverage on zoned cells for immediate 3D red refresh
+    let totalZoned = 0;
+    let noPower = 0;
+    let noWater = 0;
+    let unserviced = 0;
+    let unservicedBuilt = 0;
+    let firstBuiltUnserviced: { x: number; z: number } | null = null;
+    let firstAnyUnserviced: { x: number; z: number } | null = null;
+    let hash = 2166136261;
+
+    for (let i = 0; i < TOTAL_CELLS; i++) {
+      const zKind = this.zones[i];
+      if (zKind === ZoneKind.None) continue;
+      totalZoned++;
+      const p = this.powerMap[i] === 1 ? 1 : 0;
+      const w = this.waterMap[i] === 1 ? 1 : 0;
+      if (!p) noPower++;
+      if (!w) noWater++;
+      if (!p || !w) {
+        unserviced++;
+        const x = i % GRID_SIZE;
+        const z = Math.floor(i / GRID_SIZE);
+        if (!firstAnyUnserviced) firstAnyUnserviced = { x, z };
+        if (this.rciLevel[i] > 0) {
+          unservicedBuilt++;
+          if (!firstBuiltUnserviced) firstBuiltUnserviced = { x, z };
+        }
+      }
+      hash ^= (i * 31 + (zKind << 3) + (p << 1) + w) | 0;
+      hash = Math.imul(hash, 16777619);
+    }
+
+    this.zonedCellsTotal = totalZoned;
+    this.unpoweredZones = noPower;
+    this.unwateredZones = noWater;
+    this.unservicedZones = unserviced;
+    this.unservicedBuiltCount = unservicedBuilt;
+    this.firstUnservicedCell = firstBuiltUnserviced || firstAnyUnserviced;
+
+    const unsignedHash = hash >>> 0;
+    if (this.lastUtilityZoneHash !== -1 && unsignedHash !== this.lastUtilityZoneHash) {
+      this.meshVersion++;
+      this.overlayVersion++;
+    }
+    this.lastUtilityZoneHash = unsignedHash;
   }
 
   private bfsConductiveSpread(mask: Uint8Array, queue: number[]) {
@@ -1539,7 +1775,7 @@ export class CityEngine {
     for (let z = 0; z < GRID_SIZE; z++) {
       for (let x = 0; x < GRID_SIZE; x++) {
         const i = this.idx(x, z);
-        if (this.zones[i] === ZoneKind.Industrial && this.rciLevel[i] > 0 && !this.rciAbandoned[i]) {
+        if (this.zones[i] === ZoneKind.Industrial && this.isZoneOperational(i)) {
           const strength = 14 + this.rciLevel[i] * 5;
           this.addCircleScore(
             this.pollutionMap,
@@ -1597,7 +1833,7 @@ export class CityEngine {
           for (let dx = -3; dx <= 3; dx++) {
             const ni = this.idx(x + dx, z + dz);
             const lv = this.rciLevel[ni];
-            if (lv > 0 && !this.rciAbandoned[ni]) {
+            if (lv > 0 && this.isZoneOperational(ni)) {
               const zKind = this.zones[ni];
               const mult =
                 zKind === ZoneKind.ComHigh || zKind === ZoneKind.ResHigh
@@ -1711,8 +1947,13 @@ export class CityEngine {
             : this.taxes.industrial;
 
         if (lv === 0) {
+          // Strict lock: unserviced zoned lots stay at 0 progress and never get inhabited
+          if (!hasPower || !hasWater) {
+            this.rciProgress[i] = 0;
+            continue;
+          }
           // Spawn Level 1 building organically if utilities & road & demand exist
-          if (hasPower && hasWater && sectorDemand > 18 && this.hasNearbyZoneableRoad(x, z)) {
+          if (sectorDemand > 18 && this.hasNearbyZoneableRoad(x, z)) {
             this.rciProgress[i] += Math.round(16 + sectorDemand * 0.35);
             if (this.rciProgress[i] >= 100) {
               this.rciLevel[i] = 1;
@@ -1724,8 +1965,12 @@ export class CityEngine {
           continue;
         }
 
-        // Existing building: check abandonment / recovery
-        if (!hasPower || !hasWater || sectorTax >= 18) {
+        // Existing building: suspend operations immediately if water OR power is lost; abandon on extreme taxes
+        if (!hasPower || !hasWater) {
+          this.rciProgress[i] = Math.max(-100, this.rciProgress[i] - 25);
+          continue;
+        }
+        if (sectorTax >= 18) {
           this.rciProgress[i] -= 22;
           if (this.rciProgress[i] <= -70 && !this.rciAbandoned[i]) {
             this.rciAbandoned[i] = 1;
@@ -1861,8 +2106,8 @@ export class CityEngine {
     let indJobs = 0;
 
     for (let i = 0; i < TOTAL_CELLS; i++) {
+      if (!this.isZoneOperational(i)) continue;
       const lv = this.rciLevel[i];
-      if (lv === 0 || this.rciAbandoned[i]) continue;
       const z = this.zones[i] as ZoneKind;
 
       if (z === ZoneKind.ResLow) {
@@ -1924,12 +2169,14 @@ export class CityEngine {
     // Happiness
     const hasStadium = this.structures.some((s) => s.buildingId === 'monument_stadium');
     const avgTax = (this.taxes.residential + this.taxes.commercial + this.taxes.industrial) / 3;
+    const unservicedPenalty = Math.min(22, this.unservicedBuiltCount * 1.2);
     const rawHappy =
       68 +
       this.avgLandValue * 0.26 -
       this.avgPollution * 0.35 -
       Math.max(0, this.avgTraffic - 45) * 0.25 -
-      (avgTax - 9) * 2.4 +
+      (avgTax - 9) * 2.4 -
+      unservicedPenalty +
       (hasStadium ? 15 : 0);
     this.happiness = Math.max(15, Math.min(100, Math.round(rawHappy)));
 
@@ -2110,6 +2357,30 @@ export class CityEngine {
       powerConsumedMW: this.powerConsumedMW,
       waterProducedML: this.waterProducedML,
       waterConsumedML: this.waterConsumedML,
+      zonedCellsTotal: this.zonedCellsTotal,
+      unpoweredZones: this.unpoweredZones,
+      unwateredZones: this.unwateredZones,
+      unservicedZones: this.unservicedZones,
+      unservicedBuiltCount: this.unservicedBuiltCount,
+      firstUnservicedCell: this.firstUnservicedCell ? { ...this.firstUnservicedCell } : null,
+      utilityIssueCause: {
+        power:
+          this.unpoweredZones === 0
+            ? 'ok'
+            : this.powerProducedMW === 0
+            ? 'no_plant'
+            : this.powerConsumedMW > this.powerProducedMW * 0.75
+            ? 'overload'
+            : 'disconnected',
+        water:
+          this.unwateredZones === 0
+            ? 'ok'
+            : this.waterProducedML === 0
+            ? 'no_source'
+            : this.waterConsumedML > this.waterProducedML * 0.75
+            ? 'overload'
+            : 'disconnected',
+      },
       avgTraffic: this.avgTraffic,
       avgLandValue: this.avgLandValue,
       avgPollution: this.avgPollution,
@@ -2210,6 +2481,7 @@ export class CityEngine {
     }
 
     eng.rebuildStructureGrid();
+    eng.sanitizeRoadTopology();
     eng.enforceZoneRoadAccess();
     eng.refreshDiagonalZoneAlignment();
     eng.recomputeUtilitiesAndCoverage();

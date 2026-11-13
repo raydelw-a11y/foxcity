@@ -7,9 +7,14 @@ export interface CityProceduralAssets {
   comEmissive: THREE.CanvasTexture;
   indAlbedo: THREE.CanvasTexture;
   indEmissive: THREE.CanvasTexture;
+  offAlbedo: THREE.CanvasTexture;
+  offEmissive: THREE.CanvasTexture;
   facadeBump: THREE.CanvasTexture;
   terrainDetailTex: THREE.CanvasTexture;
   waterNormalTex: THREE.CanvasTexture;
+  asphaltTex: THREE.CanvasTexture;
+  sidewalkTex: THREE.CanvasTexture;
+  sunGlowTex: THREE.CanvasTexture;
   envMap: THREE.Texture;
 }
 
@@ -40,7 +45,7 @@ function configureTex(
 }
 
 function buildFacadePair(
-  style: 'res' | 'com' | 'ind',
+  style: 'res' | 'com' | 'ind' | 'off',
   anisotropy: number
 ): { albedo: THREE.CanvasTexture; emissive: THREE.CanvasTexture } {
   const size = 512;
@@ -51,9 +56,15 @@ function buildFacadePair(
   ectx.fillRect(0, 0, size, size);
 
   if (style === 'res') {
-    // Warm architectural stucco & brick courses with balcony shadows
-    actx.fillStyle = '#ebe3d5';
+    // Warm architectural stucco & brick courses with balcony rails & floor AO
+    actx.fillStyle = '#efe6d8';
     actx.fillRect(0, 0, size, size);
+
+    // Subtle plaster masonry texture
+    for (let y = 0; y < size; y += 8) {
+      actx.fillStyle = y % 16 === 0 ? 'rgba(120, 113, 108, 0.05)' : 'rgba(255, 255, 255, 0.06)';
+      actx.fillRect(0, y, size, 4);
+    }
 
     const cols = 8;
     const rows = 16;
@@ -64,7 +75,7 @@ function buildFacadePair(
       // Floor slab & recessed balcony shadow strip
       actx.fillStyle = r % 2 === 0 ? '#cbd5e1' : '#d6cfc2';
       actx.fillRect(0, r * ch, size, 4);
-      actx.fillStyle = 'rgba(51, 65, 85, 0.14)';
+      actx.fillStyle = 'rgba(30, 41, 59, 0.18)';
       actx.fillRect(0, r * ch + 4, size, 3);
 
       for (let c = 0; c < cols; c++) {
@@ -73,32 +84,38 @@ function buildFacadePair(
         const ww = cw - 16;
         const wh = ch - 11;
 
-        // Subtle stone/brick frame
+        // Architectural lintel & frame
         actx.fillStyle = '#94a3b8';
         actx.fillRect(wx - 2, wy - 2, ww + 4, wh + 4);
+        actx.fillStyle = '#e2e8f0';
+        actx.fillRect(wx - 3, wy - 3, ww + 6, 3);
 
         const shade = ((r * 11 + c * 7) % 4) * 5;
-        actx.fillStyle = `rgb(${54 + shade}, ${76 + shade}, ${98 + shade})`;
+        actx.fillStyle = `rgb(${54 + shade}, ${78 + shade}, ${102 + shade})`;
         actx.fillRect(wx, wy, ww, wh);
 
-        // Sky sheen
-        actx.fillStyle = 'rgba(224, 242, 254, 0.35)';
-        actx.fillRect(wx + 1, wy + 1, ww - 2, 3);
+        // Sky sheen & curtain interior variation
+        actx.fillStyle = 'rgba(224, 242, 254, 0.38)';
+        actx.fillRect(wx + 1, wy + 1, ww - 2, 4);
 
-        // Center mullion
+        // Center mullion & balcony sill guardrail on even floors
         actx.fillStyle = '#cbd5e1';
         actx.fillRect(wx + ww * 0.5 - 1, wy, 2, wh);
+        if ((r + c) % 3 === 0) {
+          actx.fillStyle = 'rgba(241, 245, 249, 0.65)';
+          actx.fillRect(wx - 2, wy + wh - 4, ww + 4, 2);
+        }
 
         const h = ((r * 41 + c * 19 + r * c * 7) % 100) / 100;
-        if (h < 0.62) {
-          ectx.fillStyle = h < 0.42 ? '#fef08a' : h < 0.54 ? '#fed7aa' : '#fde68a';
+        if (h < 0.65) {
+          ectx.fillStyle = h < 0.38 ? '#fef08a' : h < 0.52 ? '#fed7aa' : '#fde68a';
           ectx.fillRect(wx + 2, wy + 2, ww - 4, wh - 3);
         }
       }
     }
   } else if (style === 'com') {
-    // Sleek glass curtain wall & metallic spandrels with bright ground-floor retail
-    actx.fillStyle = '#94a3b8';
+    // Sleek glass curtain wall & metallic spandrels with vibrant ground-floor retail storefronts & awnings
+    actx.fillStyle = '#8aa0b8';
     actx.fillRect(0, 0, size, size);
 
     const cols = 10;
@@ -108,7 +125,7 @@ function buildFacadePair(
 
     for (let r = 0; r < rows; r++) {
       const isGroundRetail = r >= rows - 2;
-      actx.fillStyle = r % 4 === 0 ? '#cbd5e1' : '#64748b';
+      actx.fillStyle = r % 4 === 0 ? '#dbeafe' : '#64748b';
       actx.fillRect(0, r * ch, size, 3);
 
       for (let c = 0; c < cols; c++) {
@@ -120,22 +137,67 @@ function buildFacadePair(
         const shade = ((r * 17 + c * 13) % 6) * 7;
         actx.fillStyle = isGroundRetail
           ? '#1e3a5f'
-          : `rgb(${38 + shade}, ${74 + shade}, ${118 + shade})`;
+          : `rgb(${40 + shade}, ${78 + shade}, ${124 + shade})`;
         actx.fillRect(wx, wy, ww, wh);
 
-        // Diagonal glass reflection glint
-        actx.fillStyle = 'rgba(224, 242, 254, 0.42)';
+        // Crisp sky reflection streak
+        actx.fillStyle = 'rgba(224, 242, 254, 0.48)';
         actx.fillRect(wx + 1, wy + 1, ww - 2, 3);
 
+        if (isGroundRetail && r === rows - 2) {
+          // Ground-floor retail awning accent
+          actx.fillStyle = (c % 3 === 0) ? '#ea580c' : (c % 3 === 1) ? '#0284c7' : '#0f766e';
+          actx.fillRect(wx - 1, wy - 2, ww + 2, 5);
+        }
+
         const h = ((r * 37 + c * 29 + r * c * 11) % 100) / 100;
-        if (isGroundRetail || h < 0.64) {
+        if (isGroundRetail || h < 0.68) {
           ectx.fillStyle = isGroundRetail
-            ? '#fef08a'
+            ? (c % 4 === 0 ? '#fed7aa' : '#fef08a')
             : h < 0.36
             ? '#bae6fd'
-            : h < 0.52
+            : h < 0.54
             ? '#e0f2fe'
             : '#fde68a';
+          ectx.fillRect(wx + 1, wy + 1, ww - 2, wh - 2);
+        }
+      }
+    }
+  } else if (style === 'off') {
+    // High-tech cyan-silver office curtain wall with structural spandrel fins & cool LED floors
+    actx.fillStyle = '#94b2ca';
+    actx.fillRect(0, 0, size, size);
+
+    const cols = 12;
+    const rows = 24;
+    const cw = size / cols;
+    const ch = size / rows;
+
+    for (let r = 0; r < rows; r++) {
+      // Architectural double mechanical louver every 6 floors
+      const isMechFloor = r % 6 === 0;
+      actx.fillStyle = isMechFloor ? '#475569' : '#cbd5e1';
+      actx.fillRect(0, r * ch, size, isMechFloor ? 5 : 2);
+
+      for (let c = 0; c < cols; c++) {
+        const wx = c * cw + 2;
+        const wy = r * ch + (isMechFloor ? 5 : 3);
+        const ww = cw - 4;
+        const wh = ch - (isMechFloor ? 6 : 4);
+
+        const shade = ((r * 13 + c * 19) % 5) * 6;
+        actx.fillStyle = isMechFloor
+          ? '#334155'
+          : `rgb(${56 + shade}, ${114 + shade}, ${152 + shade})`;
+        actx.fillRect(wx, wy, ww, wh);
+
+        // Specular curtain-glass highlight
+        actx.fillStyle = 'rgba(224, 247, 255, 0.45)';
+        actx.fillRect(wx + 1, wy + 1, ww - 2, 2);
+
+        const h = ((r * 43 + c * 31 + r * c * 5) % 100) / 100;
+        if (!isMechFloor && h < 0.7) {
+          ectx.fillStyle = h < 0.45 ? '#e0f2fe' : h < 0.62 ? '#a5f3fc' : '#f8fafc';
           ectx.fillRect(wx + 1, wy + 1, ww - 2, wh - 2);
         }
       }
@@ -147,7 +209,7 @@ function buildFacadePair(
 
     // Corrugated vertical ribs
     for (let x = 0; x < size; x += 8) {
-      actx.fillStyle = x % 16 === 0 ? 'rgba(15, 23, 42, 0.08)' : 'rgba(255, 255, 255, 0.08)';
+      actx.fillStyle = x % 16 === 0 ? 'rgba(15, 23, 42, 0.09)' : 'rgba(255, 255, 255, 0.09)';
       actx.fillRect(x, 0, 4, size);
     }
 
@@ -285,6 +347,81 @@ function buildWaterNormalTex(anisotropy: number): THREE.CanvasTexture {
   return tex;
 }
 
+function buildAsphaltTex(anisotropy: number): THREE.CanvasTexture {
+  const size = 256;
+  const [c, ctx] = makeCanvas(size, size);
+  const img = ctx.createImageData(size, size);
+  const d = img.data;
+  const twoPi = Math.PI * 2;
+
+  for (let y = 0; y < size; y++) {
+    const ny = (y / size) * twoPi;
+    for (let x = 0; x < size; x++) {
+      const nx = (x / size) * twoPi;
+      const hash = (((x * 1619 + y * 31337) ^ ((x * y) << 2)) >>> 0) / 4294967295;
+      const wear = Math.sin(nx * 2) * 5 + Math.cos(ny * 2 + nx) * 4;
+      const grain = (hash - 0.5) * 26;
+      const lum = Math.max(198, Math.min(255, Math.round(234 + wear + grain)));
+      const idx = (y * size + x) * 4;
+      d[idx] = lum;
+      d[idx + 1] = lum;
+      d[idx + 2] = Math.min(255, lum + 3);
+      d[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = configureTex(c, anisotropy, true, 1, 1);
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  return tex;
+}
+
+function buildSidewalkTex(anisotropy: number): THREE.CanvasTexture {
+  const size = 256;
+  const [c, ctx] = makeCanvas(size, size);
+  ctx.fillStyle = '#e5e7eb';
+  ctx.fillRect(0, 0, size, size);
+
+  const step = 32;
+  ctx.strokeStyle = 'rgba(100, 116, 139, 0.28)';
+  ctx.lineWidth = 2;
+  for (let p = 0; p <= size; p += step) {
+    ctx.beginPath();
+    ctx.moveTo(p, 0);
+    ctx.lineTo(p, size);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(0, p);
+    ctx.lineTo(size, p);
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < 650; i++) {
+    const x = ((i * 73) % size);
+    const y = ((i * 139) % size);
+    ctx.fillStyle = i % 2 === 0 ? 'rgba(255,255,255,0.22)' : 'rgba(71,85,105,0.12)';
+    ctx.fillRect(x, y, 2, 2);
+  }
+  return configureTex(c, anisotropy, true, 1, 1);
+}
+
+function buildSunGlowTex(anisotropy: number): THREE.CanvasTexture {
+  const size = 256;
+  const [c, ctx] = makeCanvas(size, size);
+  const g = ctx.createRadialGradient(size / 2, size / 2, 4, size / 2, size / 2, size / 2);
+  g.addColorStop(0.0, 'rgba(255, 255, 255, 1.0)');
+  g.addColorStop(0.18, 'rgba(255, 248, 225, 0.85)');
+  g.addColorStop(0.45, 'rgba(254, 240, 138, 0.32)');
+  g.addColorStop(1.0, 'rgba(254, 240, 138, 0.0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  const tex = configureTex(c, anisotropy, true, 1, 1);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  return tex;
+}
+
 export function getCityProceduralAssets(renderer: THREE.WebGLRenderer): CityProceduralAssets {
   if (cachedAssets) return cachedAssets;
 
@@ -293,9 +430,13 @@ export function getCityProceduralAssets(renderer: THREE.WebGLRenderer): CityProc
   const res = buildFacadePair('res', anisotropy);
   const com = buildFacadePair('com', anisotropy);
   const ind = buildFacadePair('ind', anisotropy);
+  const off = buildFacadePair('off', anisotropy);
   const facadeBump = buildFacadeBump(anisotropy);
   const terrainDetailTex = buildTerrainDetailTex(anisotropy);
   const waterNormalTex = buildWaterNormalTex(anisotropy);
+  const asphaltTex = buildAsphaltTex(anisotropy);
+  const sidewalkTex = buildSidewalkTex(anisotropy);
+  const sunGlowTex = buildSunGlowTex(anisotropy);
 
   // Procedural HDR Environment Map (PMREM) for crisp glass & water reflections
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -342,9 +483,14 @@ export function getCityProceduralAssets(renderer: THREE.WebGLRenderer): CityProc
     comEmissive: com.emissive,
     indAlbedo: ind.albedo,
     indEmissive: ind.emissive,
+    offAlbedo: off.albedo,
+    offEmissive: off.emissive,
     facadeBump,
     terrainDetailTex,
     waterNormalTex,
+    asphaltTex,
+    sidewalkTex,
+    sunGlowTex,
     envMap,
   };
   return cachedAssets;

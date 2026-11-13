@@ -77,7 +77,7 @@ import {
   writeEmergencyWalSync,
 } from './utils/cloudSync';
 
-const FALLBACK_BUILD_TIMESTAMP = '9:33 PM - 11/12/2026';
+const FALLBACK_BUILD_TIMESTAMP = '5:36 AM - 11/13/2026';
 const BUILD_TS =
   typeof __BUILD_TIMESTAMP__ !== 'undefined' ? __BUILD_TIMESTAMP__ : FALLBACK_BUILD_TIMESTAMP;
 
@@ -129,6 +129,19 @@ export const App: React.FC = () => {
     backupSlotId?: string | null;
   } | null>(null);
   const [toast, setToast] = useState<{ text: string; tone: 'info' | 'warn' | 'ok' } | null>(null);
+  const [focusTarget, setFocusTarget] = useState<{ x: number; z: number; seq: number } | null>(null);
+  const [debouncedUtilityAlert, setDebouncedUtilityAlert] = useState<{
+    count: number;
+    unpowered: number;
+    unwatered: number;
+    cause: CityHudSnapshot['utilityIssueCause'];
+    firstCell: { x: number; z: number } | null;
+  } | null>(null);
+  const prevUnservicedRef = useRef<{ cityId: string; count: number; lastWarnAt: number }>({
+    cityId: '',
+    count: 0,
+    lastWarnAt: 0,
+  });
 
   const showToast = useCallback((text: string, tone: 'info' | 'warn' | 'ok' = 'info') => {
     setToast({ text, tone });
@@ -139,6 +152,70 @@ export const App: React.FC = () => {
     const t = setTimeout(() => setToast(null), 3600);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // Debounce (600ms) + edge-triggered toast for zones lacking electricity or water
+  useEffect(() => {
+    if (inHub || !hud) {
+      setDebouncedUtilityAlert(null);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (hud.unservicedZones > 0) {
+        setDebouncedUtilityAlert({
+          count: hud.unservicedZones,
+          unpowered: hud.unpoweredZones,
+          unwatered: hud.unwateredZones,
+          cause: hud.utilityIssueCause,
+          firstCell: hud.firstUnservicedCell,
+        });
+      } else {
+        setDebouncedUtilityAlert(null);
+      }
+
+      const prev = prevUnservicedRef.current;
+      if (prev.cityId !== hud.cityId) {
+        prevUnservicedRef.current = {
+          cityId: hud.cityId,
+          count: hud.unservicedZones,
+          lastWarnAt: hud.unservicedZones > 0 ? Date.now() : 0,
+        };
+        if (hud.unservicedZones > 0) {
+          showToast(
+            `🚨 ${hud.unservicedZones} zona(s) en rojo sin luz o agua: no funcionarán ni se habitarán hasta resolverlo.`,
+            'warn'
+          );
+        }
+        return;
+      }
+
+      const now = Date.now();
+      if (prev.count === 0 && hud.unservicedZones > 0 && now - prev.lastWarnAt > 18000) {
+        prev.lastWarnAt = now;
+        showToast(
+          `🚨 ${hud.unservicedZones} zona(s) marcadas en rojo por falta de luz o agua: paralizadas hasta conectarse.`,
+          'warn'
+        );
+      } else if (prev.count > 0 && hud.unservicedZones === 0 && hud.zonedCellsTotal > 0) {
+        showToast('✅ Luz y agua restablecidas en todas las zonas.', 'ok');
+      }
+      prev.count = hud.unservicedZones;
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [
+    inHub,
+    hud?.cityId,
+    hud?.unservicedZones,
+    hud?.unpoweredZones,
+    hud?.unwateredZones,
+    hud?.zonedCellsTotal,
+    hud?.utilityIssueCause.power,
+    hud?.utilityIssueCause.water,
+    hud?.firstUnservicedCell?.x,
+    hud?.firstUnservicedCell?.z,
+    showToast,
+  ]);
 
   // Refresh cloud city list & flush any pending offline slots when session is active
   useEffect(() => {
@@ -723,6 +800,7 @@ export const App: React.FC = () => {
         buildingRotation={buildingRotation}
         onRotateBuilding={rotateActiveBuilding}
         showTileGridModal={showTileModal}
+        focusTarget={focusTarget}
         onSelectInspect={(info) => setInspectInfo(info)}
         onToast={showToast}
         onAfterMutate={handleAfterMutate}
@@ -962,6 +1040,103 @@ export const App: React.FC = () => {
           </div>
         </div>
 
+        {/* Actionable Utility Lockout Alert Banner */}
+        {debouncedUtilityAlert && debouncedUtilityAlert.count > 0 && (
+          <div className="pointer-events-auto max-w-3xl mx-auto mt-2 px-3 py-2 rounded-2xl bg-rose-950/92 border border-rose-500/75 shadow-2xl backdrop-blur-xl flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 min-w-0">
+              <span className="font-black text-rose-200 flex items-center gap-1.5">
+                🚨 {debouncedUtilityAlert.count}{' '}
+                {debouncedUtilityAlert.count === 1
+                  ? 'zona en rojo paralizada'
+                  : 'zonas en rojo paralizadas'}
+              </span>
+              <span className="text-[11px] text-rose-300/95 font-medium truncate">
+                {[
+                  debouncedUtilityAlert.unpowered > 0
+                    ? debouncedUtilityAlert.cause.power === 'no_plant'
+                      ? 'Sin planta eléctrica'
+                      : debouncedUtilityAlert.cause.power === 'overload'
+                      ? 'Capacidad MW insuficiente'
+                      : 'Sin conexión a red eléctrica'
+                    : null,
+                  debouncedUtilityAlert.unwatered > 0
+                    ? debouncedUtilityAlert.cause.water === 'no_source'
+                      ? 'Sin torre o bomba de agua'
+                      : debouncedUtilityAlert.cause.water === 'overload'
+                      ? 'Capacidad de agua insuficiente'
+                      : 'Sin conexión a red de agua'
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(' • ')}{' '}
+                — Sin habitantes ni actividad hasta resolverlo.
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {debouncedUtilityAlert.unpowered > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const bId =
+                      hud.powerProducedMW > 0 && hud.powerProducedMW < hud.powerConsumedMW
+                        ? 'coal_plant'
+                        : 'wind_turbine';
+                    setActiveTab('utilities');
+                    setTool({ kind: 'building', buildingId: bId });
+                    soundFX.playClick();
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-[11px] cursor-pointer transition"
+                >
+                  ⚡ Resolver Luz
+                </button>
+              )}
+              {debouncedUtilityAlert.unwatered > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('utilities');
+                    setTool({ kind: 'building', buildingId: 'water_tower' });
+                    soundFX.playClick();
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-extrabold text-[11px] cursor-pointer transition"
+                >
+                  💧 Resolver Agua
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  const targetOv: InfoOverlayMode =
+                    debouncedUtilityAlert.unpowered > 0 ? 'power' : 'water';
+                  setOverlay((prev) => (prev === targetOv ? 'normal' : targetOv));
+                  soundFX.playClick();
+                }}
+                className="px-2.5 py-1 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-rose-400/50 text-rose-100 font-bold text-[11px] cursor-pointer transition"
+              >
+                👁️ Ver Red
+              </button>
+              {debouncedUtilityAlert.firstCell && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!debouncedUtilityAlert.firstCell) return;
+                    setFocusTarget({
+                      x: debouncedUtilityAlert.firstCell.x,
+                      z: debouncedUtilityAlert.firstCell.z,
+                      seq: Date.now(),
+                    });
+                    soundFX.playClick();
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-extrabold text-[11px] cursor-pointer transition"
+                >
+                  📍 Ir
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Skylines White Analytical Info Views Popover */}
         {showOverlayMenu && (
           <div className="pointer-events-auto mt-2 ml-auto max-w-md bg-slate-950/92 backdrop-blur-xl border border-slate-700 rounded-2xl p-3 shadow-2xl">
@@ -1090,13 +1265,19 @@ export const App: React.FC = () => {
               </div>
             )}
             <div className="flex items-center gap-3 pt-1">
-              <span className={inspectInfo.powered ? 'text-emerald-400' : 'text-rose-400'}>
+              <span className={inspectInfo.powered ? 'text-emerald-400' : 'text-rose-400 font-bold'}>
                 ⚡ {inspectInfo.powered ? 'Con Luz' : 'Sin Luz'}
               </span>
-              <span className={inspectInfo.watered ? 'text-cyan-300' : 'text-rose-400'}>
+              <span className={inspectInfo.watered ? 'text-cyan-300' : 'text-rose-400 font-bold'}>
                 💧 {inspectInfo.watered ? 'Con Agua' : 'Sin Agua'}
               </span>
             </div>
+            {inspectInfo.zone !== ZoneKind.None &&
+              (!inspectInfo.powered || !inspectInfo.watered) && (
+                <div className="mt-1 px-2 py-1.5 rounded-lg bg-rose-950/90 border border-rose-500/60 text-rose-200 font-extrabold text-[11px]">
+                  🚫 ZONA PARALIZADA (0 hab / $0 impuestos hasta recibir luz y agua)
+                </div>
+              )}
             <div>
               💎 Valor Suelo: {inspectInfo.landValue}/100 • 🏭 Polución: {inspectInfo.pollution}%
             </div>

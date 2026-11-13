@@ -192,6 +192,16 @@ export interface CityHudSnapshot {
   powerConsumedMW: number;
   waterProducedML: number;
   waterConsumedML: number;
+  zonedCellsTotal: number;
+  unpoweredZones: number;
+  unwateredZones: number;
+  unservicedZones: number;
+  unservicedBuiltCount: number;
+  firstUnservicedCell: { x: number; z: number } | null;
+  utilityIssueCause: {
+    power: 'ok' | 'no_plant' | 'overload' | 'disconnected';
+    water: 'ok' | 'no_source' | 'overload' | 'disconnected';
+  };
   avgTraffic: number;
   avgLandValue: number;
   avgPollution: number;
